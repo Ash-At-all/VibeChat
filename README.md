@@ -29,6 +29,14 @@ Posts and profile images use public storage buckets and are publicly viewable. D
 
 The in-memory rate limiter is a per-process safeguard: limits reset on restart and are not shared across server instances. Production deployment should use a shared rate-limit store and a trusted proxy that overwrites forwarding headers. The current legal pages are draft guidance and require legal review before public launch.
 
+## Private Vercel review
+
+Import the private `Ash-At-all/VibeChat` repository into Vercel with the repository root (`./`) as the project root. Set `NEXT_PUBLIC_SUPABASE_URL` and `NEXT_PUBLIC_SUPABASE_ANON_KEY` for Production and Preview, then add the deployed Vercel callback URL (`https://<project>.vercel.app/auth/callback`) to Supabase Authentication > URL Configuration > Redirect URLs. The Google provider's OAuth callback remains `https://<project-ref>.supabase.co/auth/v1/callback`.
+
+For a friends-only review on Hobby, enable Vercel Deployment Protection with **Vercel Authentication** and **All Deployments**, then share a Vercel Shareable Link with reviewers. Treat that link as a bearer credential and revoke it after review. Password protection is not available on Hobby.
+
+Vercel protection gates access to the hosted app, but it does not make Supabase data private: the current database policies allow public reads of community posts, comments, and messages, and post/avatar images are public. Use test content only; never put sensitive or private information in the review project.
+
 ## Validation
 
 ```bash
