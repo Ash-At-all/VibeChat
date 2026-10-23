@@ -3,7 +3,7 @@ import { postValidationRequestSchema } from "@/lib/post-schema";
 import { enforceRateLimit } from "@/lib/server/rate-limit";
 
 export async function POST(request: Request) {
-  const rateLimitResponse = enforceRateLimit(request, "posts");
+  const rateLimitResponse = enforceRateLimit(request, "postValidation");
   if (rateLimitResponse) return rateLimitResponse;
 
   let payload: unknown;

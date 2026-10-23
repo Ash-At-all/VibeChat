@@ -2,9 +2,16 @@
 
 import Link from "next/link";
 import Image from "next/image";
-import { FormEvent, KeyboardEvent, ReactNode, TouchEvent, useEffect, useMemo, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
+import { FormEvent, KeyboardEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import type { User } from "@supabase/supabase-js";
+import { z } from "zod";
 import { SiteBrand } from "@/components/site-brand";
 import { CITIES } from "@/lib/cities";
+import { postsRepo, type PersistedPost } from "@/lib/posts-repo";
+import { profilesRepo } from "@/lib/profiles-repo";
+import { type Profile } from "@/lib/profile-schema";
+import { getSupabaseBrowserClient, getSupabaseConfigError, isSupabaseConfigured } from "@/lib/supabase/client";
 import {
   commentDraftSchema,
   messageDraftSchema,
@@ -12,15 +19,15 @@ import {
   postDraftSchema,
   postEditSchema,
   postTagSchema,
-  postValidationRequestSchema,
   type PostTag,
 } from "@/lib/post-schema";
-import { processImage, type ImagePurpose } from "@/lib/client-image";
+import { processImage } from "@/lib/client-image";
 
-type LocalImage = { url: string; name: string; size: number; width: number; height: number };
+type LocalImage = { url: string; name: string; size: number; width: number; height: number; blob?: Blob };
 type CommentItem = {
   id: string;
   author: string;
+  author_username?: string | null;
   body: string;
   replies: CommentItem[];
 };
@@ -28,8 +35,10 @@ type Post = {
   id: string;
   city: string;
   author: string;
+  author_username?: string | null;
   initials: string;
   time: string;
+  avatar_url?: string | null;
   tag: string;
   title: string;
   body: string;
@@ -38,23 +47,21 @@ type Post = {
   comments: CommentItem[];
   mine?: boolean;
 };
-type Message = { id: string; body: string; time: string; fromYou: boolean; image?: LocalImage };
+type Message = { id: string; body: string; time: string; fromYou: boolean; author: string; author_username: string | null; initials: string };
 type Channel = { id: string; label: string };
-type Story = { id: string; name: string; initials: string; city: string; text: string };
-type Friend = { id: string; name: string; initials: string; online: boolean };
-type SafetyTarget = { type: "post" | "comment"; id: string; author: string; label: string };
+type SafetyTarget = { type: "post" | "comment"; id: string; author: string; authorUsername?: string | null; label: string; targetContent?: string };
+type BlockedAccount = { username: string; name: string };
 type SafetyReport = SafetyTarget & {
   reportId: string;
   reason: string;
   details: string;
-  status: "open" | "dismissed" | "banned";
+  status: "open" | "reviewed" | "actioned";
 };
 type PendingShare = {
   kind: "post" | "message" | "comment";
   text: string;
   postId?: string;
   parentId?: string;
-  image?: LocalImage;
 };
 
 const GENERAL_CHANNELS: Channel[] = [
@@ -64,80 +71,48 @@ const GENERAL_CHANNELS: Channel[] = [
   { id: "help", label: "Help" },
 ];
 const CITY_CHANNELS: Channel[] = [{ id: "city-chat", label: "City chat" }];
-const DEMO_FRIENDS: Friend[] = [
-  { id: "mira", name: "Mira K.", initials: "MK", online: true },
-  { id: "rohan", name: "Rohan", initials: "RO", online: true },
-  { id: "anya", name: "Anya", initials: "AN", online: false },
-  { id: "dev", name: "Dev S.", initials: "DS", online: true },
-  { id: "isha", name: "Isha", initials: "IS", online: false },
-];
-const DEMO_STORIES: Story[] = [
-  { id: "mira", name: "Mira K.", initials: "MK", city: "Pune", text: "Found a quiet breakfast spot near Deccan. Sharing local picks with the community." },
-  { id: "rohan", name: "Rohan", initials: "RO", city: "Pune", text: "Planning a relaxed weekend meetup. What should we try next?" },
-  { id: "anya", name: "Anya", initials: "AN", city: "Mumbai", text: "A few small cafes around the neighbourhood are worth a visit." },
-  { id: "dev", name: "Dev S.", initials: "DS", city: "Pune", text: "Moving soon? I put together a checklist for finding a flat." },
-  { id: "isha", name: "Isha", initials: "IS", city: "Bengaluru", text: "Looking for people to explore local markets this weekend." },
-];
-
-const INITIAL_POSTS: Post[] = [
-  {
-    id: "pune-market",
-    city: "pune",
-    author: "Mira K.",
-    initials: "MK",
-    time: "Demo post",
-    tag: "Food",
-    title: "Good places for breakfast near Deccan?",
-    body: "Looking for a quiet spot with good coffee and breakfast. Local recommendations are welcome.",
-    votes: 8,
-    comments: [
-      {
-        id: "pune-market-c1",
-        author: "Rohan",
-        body: "Vaishali is a classic, especially if you get there early.",
-        replies: [
-          {
-            id: "pune-market-c1-r1",
-            author: "Mira K.",
-            body: "Thanks, I will try it this weekend.",
-            replies: [],
-          },
-        ],
-      },
-      {
-        id: "pune-market-c2",
-        author: "Anya",
-        body: "There are a few smaller cafes on Apte Road too.",
-        replies: [],
-      },
-    ],
-  },
-  {
-    id: "pune-rent",
-    city: "pune",
-    author: "Dev S.",
-    initials: "DS",
-    time: "Demo post",
-    tag: "Rent",
-    title: "What should I check before renting a flat?",
-    body: "Moving to Pune next month. What questions should I ask a landlord before signing?",
-    votes: 5,
-    comments: [],
-  },
-  {
-    id: "general-welcome",
-    city: "general",
-    author: "VibeChat team",
-    initials: "VC",
-    time: "Demo post",
-    tag: "Welcome",
-    title: "Welcome to General Chat",
-    body: "Use the channels to meet people, plan a meetup, work through a problem, or ask the community for help. Please keep personal details private.",
-    votes: 3,
-    comments: [],
-  },
-];
-
+const messageResponseSchema = z.object({
+  messages: z.array(z.object({
+    id: z.string(),
+    body: z.string(),
+    time: z.string(),
+    fromYou: z.boolean(),
+    author: z.string(),
+    author_username: z.string().nullable(),
+    initials: z.string(),
+  })),
+});
+const reportsResponseSchema = z.object({
+  isModerator: z.boolean(),
+  reports: z.array(z.object({
+    id: z.string(),
+    type: z.enum(["post", "comment"]),
+    targetId: z.string(),
+    targetContent: z.string(),
+    reason: z.string(),
+    details: z.string(),
+    status: z.enum(["open", "reviewed", "actioned"]),
+  })),
+});
+const blocksResponseSchema = z.object({
+  blocked: z.array(z.object({ username: z.string(), name: z.string() })),
+});
+const commentResponseSchema = z.object({
+  comment: z.object({
+    id: z.string(),
+    author: z.string(),
+    author_username: z.string().nullable().optional(),
+    body: z.string(),
+  }),
+});
+const reportResponseSchema = z.object({
+  report: z.object({
+    id: z.string(),
+    reason: z.string(),
+    details: z.string(),
+    status: z.enum(["open", "reviewed", "actioned"]),
+  }),
+});
 function includesPersonalInfo(value: string) {
   const phone = /(?:\+?\d[\d().\s-]{8,}\d)/;
   const address = /\b(?:my address|i live at|street address|flat number|apartment number|house number|postal address)\b/i;
@@ -165,8 +140,44 @@ function initials(name: string) {
     .toUpperCase();
 }
 
-function makeId(prefix: string) {
-  return `${prefix}-${crypto.randomUUID()}`;
+function toPost(row: PersistedPost, userId?: string, profile: Profile | null = null): Post {
+  const mine = row.mine === true || (userId !== undefined && row.author_id === userId);
+  const author = mine ? (profile?.display_name || profile?.username || "You") : row.author || "Community member";
+  const createdAt = new Date(row.created_at);
+  const storage = getSupabaseBrowserClient()?.storage.from("post-images");
+  const mineInitials = mine && profile
+    ? (profile.display_name || profile.username)
+      .split(/[_\s]+/)
+      .map((part: string) => part[0])
+      .filter(Boolean)
+      .slice(0, 2)
+      .join("")
+      .toUpperCase() || "YO"
+    : "YO";
+  return {
+    id: row.id,
+    city: row.city_slug,
+    author,
+    author_username: mine ? profile?.username ?? row.author_username : row.author_username,
+    initials: mine ? mineInitials : initials(author),
+    avatar_url: mine ? profile?.avatar_url ?? row.avatar_url ?? null : row.avatar_url ?? null,
+    time: Number.isNaN(createdAt.getTime()) ? "Recently" : createdAt.toLocaleString(),
+    tag: row.tag,
+    title: row.title,
+    body: row.body,
+    images: row.image_paths.map((path) => {
+      return {
+        url: storage?.getPublicUrl(path).data.publicUrl ?? "",
+        name: "Community post image",
+        size: 0,
+        width: 1600,
+        height: 1200,
+      };
+    }).filter((image) => image.url.length > 0),
+    votes: row.votes ?? 0,
+    comments: row.comments ?? [],
+    mine,
+  };
 }
 
 export default function Home() {
@@ -177,49 +188,52 @@ export default function Home() {
   const [mobileView, setMobileView] = useState<"board" | "chat">("chat");
   const [citySearch, setCitySearch] = useState("");
   const [postSearch, setPostSearch] = useState("");
-  const [posts, setPosts] = useState<Post[]>(INITIAL_POSTS);
+  const [posts, setPosts] = useState<Post[]>([]);
   const [postImages, setPostImages] = useState<LocalImage[]>([]);
-  const [chatImage, setChatImage] = useState<LocalImage | null>(null);
-  const [avatarImage, setAvatarImage] = useState<LocalImage | null>(null);
   const [messages, setMessages] = useState<Record<string, Message[]>>({});
-  const [loading, setLoading] = useState(true);
+  const [postLoadResult, setPostLoadResult] = useState<{ city: string; error: string | null } | null>(null);
+  const [postsRefresh, setPostsRefresh] = useState(0);
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const currentUserId = currentUser?.id ?? null;
+  const [profileState, setProfileState] = useState<{ userId: string; profile: Profile | null } | null>(null);
+  const [authLoading, setAuthLoading] = useState(false);
+  const [authError, setAuthError] = useState<string | null>(null);
   const [newPostOpen, setNewPostOpen] = useState(false);
   const [postTitle, setPostTitle] = useState("");
   const [postBody, setPostBody] = useState("");
   const [postTag, setPostTag] = useState<PostTag>("General");
   const [chatDraft, setChatDraft] = useState("");
+  const [chatCooldown, setChatCooldown] = useState(false);
   const [commentDrafts, setCommentDrafts] = useState<Record<string, string>>({});
   const [replyDraft, setReplyDraft] = useState("");
   const [replyingTo, setReplyingTo] = useState<string | null>(null);
   const [expandedPosts, setExpandedPosts] = useState<string[]>([]);
   const [votes, setVotes] = useState<Record<string, number>>({});
+  const [blockedState, setBlockedState] = useState<{ userId: string; accounts: BlockedAccount[] } | null>(null);
   const [editingPost, setEditingPost] = useState<string | null>(null);
   const [editTitleDraft, setEditTitleDraft] = useState("");
   const [editDraft, setEditDraft] = useState("");
-  const [blockedAuthors, setBlockedAuthors] = useState<string[]>([]);
-  const [bannedAuthors, setBannedAuthors] = useState<string[]>([]);
   const [safetyReports, setSafetyReports] = useState<SafetyReport[]>([]);
   const [reportTarget, setReportTarget] = useState<SafetyTarget | null>(null);
   const [reportReason, setReportReason] = useState("");
   const [reportDetails, setReportDetails] = useState("");
   const [safetyCenterOpen, setSafetyCenterOpen] = useState(false);
-  const [ageGateOpen, setAgeGateOpen] = useState(true);
-  const [ageGateChecked, setAgeGateChecked] = useState(false);
-  const [ageGateDenied, setAgeGateDenied] = useState(false);
+  const [moderatorView, setModeratorView] = useState(false);
   const [pendingShare, setPendingShare] = useState<PendingShare | null>(null);
   const [notice, setNotice] = useState<{ kind: "error" | "success"; text: string } | null>(null);
   const [authOpen, setAuthOpen] = useState(false);
-  const [avatarError, setAvatarError] = useState<string | null>(null);
-  const [activeStory, setActiveStory] = useState<Story | null>(null);
-  const [activeFriendId, setActiveFriendId] = useState<string | null>(null);
   const [leftRailOpen, setLeftRailOpen] = useState(false);
   const [rightRailOpen, setRightRailOpen] = useState(false);
-  const [voiceChatOpen, setVoiceChatOpen] = useState(false);
+  const [chatLoading, setChatLoading] = useState(false);
+  const [chatLoadError, setChatLoadError] = useState<string | null>(null);
   const [chatError, setChatError] = useState<string | null>(null);
   const mainRef = useRef<HTMLElement>(null);
   const chatLogRef = useRef<HTMLDivElement>(null);
-  const friendTouchStartY = useRef<number | null>(null);
   const imageUrls = useRef(new Set<string>());
+  const previousFocus = useRef<HTMLElement | null>(null);
+  const router = useRouter();
+  const noticeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const profile = profileState?.userId === currentUserId ? profileState.profile : null;
 
   useEffect(() => () => {
     for (const url of imageUrls.current) URL.revokeObjectURL(url);
@@ -227,20 +241,10 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    const timer = window.setTimeout(() => setLoading(false), 300);
-    return () => window.clearTimeout(timer);
-  }, []);
-
-  useEffect(() => {
     const timer = window.setTimeout(() => {
       try {
-        if (localStorage.getItem("vibechat-18plus-confirmed") === "true") {
-          setAgeGateOpen(false);
-        }
         const storedJoined: unknown = JSON.parse(localStorage.getItem("vibechat-joined-cities") ?? "[]");
         const storedFavourites: unknown = JSON.parse(localStorage.getItem("vibechat-favourites") ?? "[]");
-        const storedBlocked: unknown = JSON.parse(localStorage.getItem("vibechat-blocked-authors") ?? "[]");
-        const storedBanned: unknown = JSON.parse(localStorage.getItem("vibechat-banned-authors") ?? "[]");
         if (Array.isArray(storedJoined)) {
           setJoined(["general", ...storedJoined.filter((slug): slug is string =>
             typeof slug === "string" && slug !== "general" && CITIES.some((item) => item.slug === slug),
@@ -251,19 +255,197 @@ export default function Home() {
             typeof slug === "string" && CITIES.some((item) => item.slug === slug),
           ));
         }
-        if (Array.isArray(storedBlocked)) {
-          setBlockedAuthors(storedBlocked.filter((author): author is string => typeof author === "string"));
-        }
-        if (Array.isArray(storedBanned)) {
-          setBannedAuthors(storedBanned.filter((author): author is string => typeof author === "string"));
-        }
       } catch {
-        setNotice({ kind: "error", text: "Could not load saved age or safety preferences. Check this browser's storage settings." });
+        setNotice({ kind: "error", text: "Could not load saved city preferences. Check this browser's storage settings." });
       }
     }, 0);
     return () => window.clearTimeout(timer);
   }, []);
 
+  useEffect(() => {
+    if (!isSupabaseConfigured()) return;
+
+    let active = true;
+    let authErrorTimer: number | undefined;
+    const supabase = getSupabaseBrowserClient();
+    if (!supabase) return;
+
+    void supabase.auth.getSession().then(({ data, error }) => {
+      if (!active) return;
+      if (error) setAuthError("Could not restore your sign-in. Please try signing in again.");
+      setCurrentUser(data.session?.user ?? null);
+    });
+    const { data: authListener } = supabase.auth.onAuthStateChange((_event, session) => {
+      setCurrentUser(session?.user ?? null);
+      if (!session) setProfileState(null);
+      setAuthError(null);
+    });
+
+    const query = new URLSearchParams(window.location.search);
+    const callbackError = query.get("auth_error");
+    if (callbackError) {
+      const message = callbackError === "missing_code"
+        ? "Google sign-in did not return an authorization code. Please try again."
+        : "Google sign-in could not be completed. Check your Supabase Google provider settings and try again.";
+      authErrorTimer = window.setTimeout(() => {
+        if (active) {
+          setAuthError(message);
+          setAuthOpen(true);
+        }
+      }, 0);
+      window.history.replaceState({}, "", window.location.pathname);
+    }
+
+    return () => {
+      active = false;
+      if (authErrorTimer !== undefined) window.clearTimeout(authErrorTimer);
+      authListener.subscription.unsubscribe();
+    };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    if (!isSupabaseConfigured() || !currentUserId) return () => { active = false; };
+    void profilesRepo.getProfile()
+      .then((p) => {
+        if (!active) return;
+        setProfileState({ userId: currentUserId, profile: p });
+        if (!p) router.push("/profile");
+      })
+      .catch((error: unknown) => {
+        if (active) {
+          setNotice({
+            kind: "error",
+            text: error instanceof Error ? error.message : "Could not load your profile.",
+          });
+        }
+      });
+    return () => { active = false; };
+  }, [currentUserId, router]);
+
+  useEffect(() => {
+    if (!currentUserId) return;
+    let active = true;
+    void fetch("/api/blocks", { cache: "no-store" })
+      .then(async (response) => {
+        const result: unknown = await response.json();
+        if (!response.ok) {
+          const message = typeof result === "object" && result !== null && "error" in result && typeof result.error === "string"
+            ? result.error
+            : "Could not load blocked accounts.";
+          throw new Error(message);
+        }
+        const parsed = blocksResponseSchema.safeParse(result);
+        if (!parsed.success) throw new Error("The server returned an invalid block list.");
+        if (active) setBlockedState({ userId: currentUserId, accounts: parsed.data.blocked });
+      })
+      .catch((error: unknown) => {
+        if (active) setNotice({ kind: "error", text: error instanceof Error ? error.message : "Could not load blocked accounts." });
+      });
+    return () => { active = false; };
+  }, [currentUserId]);
+
+  useEffect(() => {
+    if (!isSupabaseConfigured()) return;
+    let active = true;
+    void postsRepo.listPosts(citySlug === "general" ? undefined : citySlug)
+      .then((rows) => {
+        if (active) {
+          setPosts(rows.map((row) => toPost(row, currentUserId ?? undefined, profile)));
+          setVotes(Object.fromEntries(rows.map((row) => [row.id, row.user_vote ?? 0])));
+          setPostLoadResult({ city: citySlug, error: null });
+        }
+      })
+      .catch((error: unknown) => {
+        if (active) {
+          setPostLoadResult({
+            city: citySlug,
+            error: error instanceof Error ? error.message : "Could not load posts. Please try again.",
+          });
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, [citySlug, currentUserId, postsRefresh, profile]);
+
+  useEffect(() => {
+    let active = true;
+    const key = `${citySlug}:${channelId}`;
+    async function loadMessages(showLoading = false) {
+      if (!isSupabaseConfigured()) {
+        setChatLoadError("Set up Supabase to load and send shared messages.");
+        setChatLoading(false);
+        return;
+      }
+      if (showLoading) setChatLoading(true);
+      try {
+        const response = await fetch(
+          `/api/messages?city=${encodeURIComponent(citySlug)}&channel=${encodeURIComponent(channelId)}`,
+          { cache: "no-store" },
+        );
+        const data: unknown = await response.json();
+        if (!response.ok) {
+          const message = typeof data === "object" && data !== null && "error" in data && typeof data.error === "string"
+            ? data.error
+            : "Could not load messages. Please try again.";
+          throw new Error(message);
+        }
+        const parsed = messageResponseSchema.safeParse(data);
+        if (!parsed.success) {
+          throw new Error("The server returned an invalid message response.");
+        }
+        if (!active) return;
+        const nextMessages = parsed.data.messages.map((message) => ({
+          id: message.id,
+          body: message.body,
+          time: message.time,
+          fromYou: message.fromYou,
+          author: message.author,
+          author_username: message.author_username,
+          initials: message.initials,
+        }));
+        setMessages((current) => {
+          const previous = current[key] ?? [];
+          const unchanged = previous.length === nextMessages.length
+            && previous.every((message, index) => {
+              const next = nextMessages[index];
+              return message.id === next.id
+                && message.body === next.body
+                && message.time === next.time
+                && message.fromYou === next.fromYou
+                && message.author === next.author
+                && message.author_username === next.author_username
+                && message.initials === next.initials;
+            });
+          return unchanged ? current : { ...current, [key]: nextMessages };
+        });
+        setChatLoadError(null);
+      } catch (error) {
+        if (active) {
+          setChatLoadError(error instanceof Error ? error.message : "Could not load messages. Please try again.");
+        }
+      } finally {
+        if (active) setChatLoading(false);
+      }
+    }
+
+    void loadMessages(true);
+    const refresh = window.setInterval(() => void loadMessages(), 5000);
+    return () => {
+      active = false;
+      window.clearInterval(refresh);
+    };
+  }, [citySlug, channelId]);
+
+  const blockedAuthors = useMemo(
+    () => blockedState?.userId === currentUserId ? blockedState.accounts : [],
+    [blockedState, currentUserId],
+  );
+  const loading = isSupabaseConfigured() && postLoadResult?.city !== citySlug;
+  const postsError = !isSupabaseConfigured()
+    ? "Configure Supabase to load shared community posts."
+    : postLoadResult?.city === citySlug ? postLoadResult.error : null;
   const city = CITIES.find((item) => item.slug === citySlug) ?? CITIES[0];
   const channels = city.slug === "general" ? GENERAL_CHANNELS : CITY_CHANNELS;
   const primaryChannel = channels[0];
@@ -277,80 +459,89 @@ export default function Home() {
           `${post.title} ${post.body} ${post.tag} ${post.author}`
             .toLocaleLowerCase()
             .includes(query);
-        return matchesCity && matchesSearch && !blockedAuthors.includes(post.author) && !bannedAuthors.includes(post.author);
+        return matchesCity && matchesSearch
+          && !blockedAuthors.some((blocked) => blocked.username === post.author_username);
       }),
-    [bannedAuthors, blockedAuthors, citySlug, postSearch, posts],
+    [blockedAuthors, citySlug, postSearch, posts],
   );
   const cityMatches = CITIES.filter((item) =>
     `${item.name} ${item.region}`.toLocaleLowerCase().includes(citySearch.trim().toLocaleLowerCase()),
   ).sort((a, b) => a.name.localeCompare(b.name));
-  const currentMessages = useMemo(
-    () => messages[`${citySlug}:${channelId}`] ?? [],
-    [channelId, citySlug, messages],
+  const blockedUsernames = useMemo(
+    () => new Set(blockedAuthors.map((account) => account.username)),
+    [blockedAuthors],
   );
-  const activeFriend = DEMO_FRIENDS.find((friend) => friend.id === activeFriendId);
+  const currentMessages = useMemo(
+    () => (messages[`${citySlug}:${channelId}`] ?? [])
+      .filter((message) => !message.author_username || !blockedUsernames.has(message.author_username)),
+    [blockedUsernames, channelId, citySlug, messages],
+  );
 
-  function confirmAgeGate(confirmed = ageGateChecked) {
-    if (!confirmed) return;
-    setAgeGateChecked(true);
-    setAgeGateOpen(false);
-    setAgeGateDenied(false);
+  async function updateBlock(username: string, blocked: boolean) {
+    if (!currentUser) {
+      setAuthOpen(true);
+      setNotice({ kind: "error", text: "Sign in to block or unblock accounts." });
+      return;
+    }
+    const userId = currentUser.id;
     try {
-      localStorage.setItem("vibechat-18plus-confirmed", "true");
-    } catch {
-      setNotice({ kind: "error", text: "You can continue, but this browser could not save your 18+ confirmation. You may be asked again next time." });
+      const response = await fetch("/api/blocks", {
+        method: blocked ? "POST" : "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username }),
+      });
+      const result: unknown = await response.json();
+      if (!response.ok) {
+        const message = typeof result === "object" && result !== null && "error" in result && typeof result.error === "string"
+          ? result.error
+          : "Could not update your blocked accounts.";
+        throw new Error(message);
+      }
+      if (blocked) {
+        const parsed = z.object({ blocked: z.object({ username: z.string(), name: z.string() }) }).safeParse(result);
+        if (!parsed.success) throw new Error("The server returned an invalid block response.");
+        setBlockedState((current) => {
+          const accounts = current?.userId === userId ? current.accounts : [];
+          return {
+            userId,
+            accounts: [...accounts.filter((account) => account.username !== username), parsed.data.blocked],
+          };
+        });
+        setNotice({ kind: "success", text: `${parsed.data.blocked.name} has been blocked.` });
+      } else {
+        setBlockedState((current) => ({
+          userId,
+          accounts: current?.userId === userId
+            ? current.accounts.filter((account) => account.username !== username)
+            : [],
+        }));
+        setNotice({ kind: "success", text: `${username} has been unblocked.` });
+      }
+    } catch (error) {
+      setNotice({ kind: "error", text: error instanceof Error ? error.message : "Could not update your blocked accounts." });
     }
   }
 
-  function blockAuthor(author: string) {
-    const nextBlocked = [...new Set([...blockedAuthors, author])];
-    setBlockedAuthors(nextBlocked);
+  async function moderateReport(reportId: string, status: "reviewed" | "actioned") {
     try {
-      localStorage.setItem("vibechat-blocked-authors", JSON.stringify(nextBlocked));
-      setNotice({ kind: "success", text: `${author} is blocked in this browser preview. Their posts are hidden from you.` });
-    } catch {
-      setNotice({ kind: "error", text: "The block could not be saved in this browser." });
-    }
-  }
-
-  function unblockAuthor(author: string) {
-    const nextBlocked = blockedAuthors.filter((item) => item !== author);
-    setBlockedAuthors(nextBlocked);
-    try {
-      localStorage.setItem("vibechat-blocked-authors", JSON.stringify(nextBlocked));
-      setNotice({ kind: "success", text: `${author} has been unblocked in this browser preview.` });
-    } catch {
-      setNotice({ kind: "error", text: "The unblock could not be saved in this browser." });
-    }
-  }
-
-  function banAuthor(author: string, reportId: string) {
-    const nextBanned = [...new Set([...bannedAuthors, author])];
-    setBannedAuthors(nextBanned);
-    setSafetyReports((current) => current.map((report) =>
-      report.reportId === reportId ? { ...report, status: "banned" } : report,
-    ));
-    try {
-      localStorage.setItem("vibechat-banned-authors", JSON.stringify(nextBanned));
-      setNotice({ kind: "success", text: `${author} was banned in this local moderator preview only.` });
-    } catch {
-      setNotice({ kind: "error", text: "The local preview ban could not be saved in this browser." });
-    }
-  }
-
-  function liftBan(author: string) {
-    const nextBanned = bannedAuthors.filter((item) => item !== author);
-    setBannedAuthors(nextBanned);
-    try {
-      localStorage.setItem("vibechat-banned-authors", JSON.stringify(nextBanned));
+      const response = await fetch("/api/reports", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: reportId, status }),
+      });
+      const result: unknown = await response.json();
+      if (!response.ok) {
+        const message = typeof result === "object" && result !== null && "error" in result && typeof result.error === "string"
+          ? result.error
+          : "Could not update the report.";
+        throw new Error(message);
+      }
       setSafetyReports((current) => current.map((report) =>
-        report.author === author && report.status === "banned"
-          ? { ...report, status: "open" }
-          : report,
+        report.reportId === reportId ? { ...report, status } : report,
       ));
-      setNotice({ kind: "success", text: `The local preview ban for ${author} was lifted.` });
-    } catch {
-      setNotice({ kind: "error", text: "The preview ban could not be lifted in this browser." });
+      setNotice({ kind: "success", text: `Report marked ${status}.` });
+    } catch (error) {
+      setNotice({ kind: "error", text: error instanceof Error ? error.message : "Could not update the report." });
     }
   }
 
@@ -360,26 +551,45 @@ export default function Home() {
     setReportDetails("");
   }
 
-  function submitReport(event: FormEvent<HTMLFormElement>) {
+  async function submitReport(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!reportTarget || !reportReason) return;
-    const report: SafetyReport = {
-      ...reportTarget,
-      reportId: makeId("report"),
-      reason: reportReason,
-      details: reportDetails.trim(),
-      status: "open",
-    };
-    setSafetyReports((current) => [report, ...current]);
-    setReportTarget(null);
-    setSafetyCenterOpen(true);
-    setNotice({ kind: "success", text: "Report added to this browser's demo moderation queue. It was not sent to a moderator." });
-  }
-
-  function dismissReport(reportId: string) {
-    setSafetyReports((current) => current.map((report) =>
-      report.reportId === reportId ? { ...report, status: "dismissed" } : report,
-    ));
+    try {
+      const response = await fetch("/api/reports", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          type: reportTarget.type,
+          targetId: reportTarget.id,
+          reason: reportReason,
+          details: reportDetails.trim(),
+        }),
+      });
+      const result: unknown = await response.json();
+      if (!response.ok) {
+        const message = typeof result === "object" && result !== null && "error" in result && typeof result.error === "string"
+          ? result.error
+          : "Could not submit your report. Please try again.";
+        throw new Error(message);
+      }
+      const parsedResult = reportResponseSchema.safeParse(result);
+      if (!parsedResult.success) {
+        throw new Error("The server returned an invalid report response.");
+      }
+      const saved = parsedResult.data.report;
+      setSafetyReports((current) => [{
+        ...reportTarget,
+        reportId: saved.id,
+        reason: saved.reason,
+        details: saved.details,
+        status: saved.status,
+      }, ...current]);
+      setReportTarget(null);
+      setSafetyCenterOpen(true);
+      setNotice({ kind: "success", text: "Your report was submitted to the community safety team." });
+    } catch (error) {
+      setNotice({ kind: "error", text: error instanceof Error ? error.message : "Could not submit your report." });
+    }
   }
 
   useEffect(() => {
@@ -388,6 +598,122 @@ export default function Home() {
       log.scrollTo({ top: log.scrollHeight, behavior: "smooth" });
     }
   }, [currentMessages]);
+
+  useEffect(() => {
+    if (!safetyCenterOpen) return;
+    let active = true;
+    void fetch("/api/reports", { cache: "no-store" })
+      .then(async (response) => {
+        const result: unknown = await response.json();
+        if (!response.ok) {
+          const message = typeof result === "object" && result !== null && "error" in result && typeof result.error === "string"
+            ? result.error
+            : "Could not load your reports.";
+          throw new Error(message);
+        }
+        const parsed = reportsResponseSchema.safeParse(result);
+        if (!parsed.success) {
+          throw new Error("The server returned an invalid report response.");
+        }
+        if (!active) return;
+        setModeratorView(parsed.data.isModerator);
+        setSafetyReports(parsed.data.reports.map((report) => ({
+          type: report.type,
+          id: report.targetId,
+          author: "Community member",
+          authorUsername: null,
+          label: `${report.type} · ${String(report.targetId).slice(0, 8)}`,
+          targetContent: report.targetContent,
+          reportId: report.id,
+          reason: report.reason,
+          details: report.details,
+          status: report.status,
+        })));
+      })
+      .catch((error: unknown) => {
+        if (active) setNotice({ kind: "error", text: error instanceof Error ? error.message : "Could not load your reports." });
+      });
+    return () => { active = false; };
+  }, [safetyCenterOpen]);
+
+  useEffect(() => {
+    if (noticeTimer.current) {
+      clearTimeout(noticeTimer.current);
+      noticeTimer.current = null;
+    }
+    if (notice?.kind === "success") {
+      noticeTimer.current = setTimeout(() => setNotice(null), 5000);
+    }
+    return () => {
+      if (noticeTimer.current) clearTimeout(noticeTimer.current);
+    };
+  }, [notice]);
+
+  useEffect(() => {
+    const anyModalOpen =
+      authOpen ||
+      reportTarget !== null ||
+      safetyCenterOpen ||
+      pendingShare !== null;
+    if (anyModalOpen) {
+      previousFocus.current = document.activeElement as HTMLElement | null;
+      return;
+    }
+    if (previousFocus.current) {
+      previousFocus.current.focus({ preventScroll: true });
+      previousFocus.current = null;
+    }
+  }, [authOpen, reportTarget, safetyCenterOpen, pendingShare]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      try {
+        const raw = localStorage.getItem(`vibechat-draft-post-${citySlug}`);
+        if (raw) {
+          const draft = JSON.parse(raw);
+          if (draft && typeof draft === "object") {
+            if (typeof draft.title === "string") setPostTitle(draft.title);
+            if (typeof draft.body === "string") setPostBody(draft.body);
+            if (POST_TAGS.includes(draft.tag)) setPostTag(draft.tag);
+          }
+        }
+      } catch {}
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [citySlug]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        `vibechat-draft-post-${citySlug}`,
+        JSON.stringify({ title: postTitle, body: postBody, tag: postTag }),
+      );
+    } catch {}
+  }, [citySlug, postTitle, postBody, postTag]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      try {
+        const raw = localStorage.getItem(`vibechat-draft-chat-${citySlug}:${channelId}`);
+        if (raw) {
+          const draft = JSON.parse(raw);
+          if (draft && typeof draft === "object" && typeof draft.body === "string") {
+            setChatDraft(draft.body);
+          }
+        }
+      } catch {}
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [citySlug, channelId]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        `vibechat-draft-chat-${citySlug}:${channelId}`,
+        JSON.stringify({ body: chatDraft }),
+      );
+    } catch {}
+  }, [citySlug, channelId, chatDraft]);
 
   function selectCity(slug: string) {
     setCitySlug(slug);
@@ -466,14 +792,6 @@ export default function Home() {
     }
   }
 
-  async function validatePostOnServer(input: unknown) {
-    const requestData = postValidationRequestSchema.safeParse(input);
-    if (!requestData.success) {
-      return requestData.error.issues.map((issue) => issue.message).join(" ");
-    }
-    return validateOnServer("/api/posts/validate", requestData.data, "post");
-  }
-
   async function publishPost(input: unknown) {
     const parsed = postDraftSchema.safeParse(input);
     if (!parsed.success) {
@@ -481,34 +799,49 @@ export default function Home() {
       return;
     }
 
-    const validationError = await validatePostOnServer({ operation: "create", post: parsed.data });
-    if (validationError) {
-      setNotice({ kind: "error", text: validationError });
+    if (!isSupabaseConfigured()) {
+      setNotice({ kind: "error", text: "Configure Supabase before publishing community posts." });
       return;
     }
+    if (!currentUser) {
+      setAuthError(null);
+      setAuthOpen(true);
+      setNotice({ kind: "error", text: "Sign in with Google before publishing a shared post." });
+      return;
+    }
+    let uploadedPaths: string[] = [];
+    try {
+      if (postImages.length > 0) {
+        const blobs = postImages.map((image) => {
+          if (!image.blob) throw new Error("One of the selected images is no longer available. Please attach it again.");
+          return image.blob;
+        });
+        uploadedPaths = await postsRepo.uploadPostImages(blobs);
+      }
 
-    setPosts((current) => [
-      {
-        id: makeId("post"),
-        city: parsed.data.city,
-        author: "You",
-        initials: "YO",
-        time: "Just now",
-        tag: parsed.data.tag,
-        title: parsed.data.title,
-        body: parsed.data.body,
-        images: postImages,
-        votes: 0,
-        comments: [],
-        mine: true,
-      },
-      ...current,
-    ]);
-    setPostTitle("");
-    setPostBody("");
-    setPostImages([]);
-    setNewPostOpen(false);
-    setNotice({ kind: "success", text: "Post added in this demo. It is not shared with other people." });
+      const row = await postsRepo.createPost(parsed.data, uploadedPaths);
+      setPosts((current) => [toPost(row, currentUser.id, profile), ...current]);
+      setPostTitle("");
+      setPostBody("");
+      for (const image of postImages) {
+        if (image.url.startsWith("blob:")) URL.revokeObjectURL(image.url);
+        imageUrls.current.delete(image.url);
+      }
+      setPostImages([]);
+      setNewPostOpen(false);
+      setNotice({ kind: "success", text: "Post published to the community." });
+    } catch (error) {
+      let message = error instanceof Error ? error.message : "Could not publish your post.";
+      if (uploadedPaths.length > 0) {
+        try {
+          await postsRepo.removePostImages(uploadedPaths);
+        } catch (cleanupError) {
+          console.error("Uploaded post images could not be cleaned up:", cleanupError);
+          message += " Some uploaded images could not be cleaned up.";
+        }
+      }
+      setNotice({ kind: "error", text: message });
+    }
   }
 
   function submitPost(event: FormEvent<HTMLFormElement>) {
@@ -538,23 +871,89 @@ export default function Home() {
       return;
     }
 
-    const validationError = await validatePostOnServer({ operation: "edit", post: parsed.data });
-    if (validationError) {
-      setNotice({ kind: "error", text: validationError });
+    if (!isSupabaseConfigured()) {
+      setNotice({ kind: "error", text: "Configure Supabase before editing community posts." });
+      return;
+    }
+    try {
+      const saved = await postsRepo.updatePost(postId, parsed.data);
+      setPosts((current) => current.map((post) =>
+        post.id === postId ? { ...post, title: saved.title, body: saved.body } : post,
+      ));
+      setEditingPost(null);
+      setNotice({ kind: "success", text: "Post updated." });
+    } catch (error) {
+      setNotice({ kind: "error", text: error instanceof Error ? error.message : "Could not update your post." });
+    }
+  }
+
+  async function deletePost(post: Post) {
+    if (!isSupabaseConfigured()) {
+      setNotice({ kind: "error", text: "Configure Supabase before deleting community posts." });
+      return;
+    }
+    let cleanupWarning: string | null;
+    try {
+      cleanupWarning = await postsRepo.deletePost(post.id);
+    } catch (error) {
+      setNotice({ kind: "error", text: error instanceof Error ? error.message : "Could not delete your post." });
+      return;
+    }
+    post.images?.forEach((image) => {
+      if (image.url.startsWith("blob:")) URL.revokeObjectURL(image.url);
+      imageUrls.current.delete(image.url);
+    });
+    setPosts((current) => current.filter((item) => item.id !== post.id));
+    setNotice(cleanupWarning
+      ? { kind: "error", text: cleanupWarning }
+      : { kind: "success", text: "Post deleted." });
+  }
+
+  async function signInWithGoogle() {
+    const supabase = getSupabaseBrowserClient();
+    if (!supabase) {
+      setAuthError(getSupabaseConfigError() ?? "Supabase client could not be initialized.");
       return;
     }
 
-    setPosts((current) => current.map((post) =>
-      post.id === postId
-        ? { ...post, title: parsed.data.title, body: parsed.data.body }
-        : post,
-    ));
-    setEditingPost(null);
-    setNotice({ kind: "success", text: "Post updated in this demo." });
+    setAuthLoading(true);
+    setAuthError(null);
+    const redirectTo = `${window.location.origin}/auth/callback?next=/`;
+    const { error } = await supabase.auth.signInWithOAuth({
+      provider: "google",
+      options: { redirectTo },
+    });
+    if (error) {
+      setAuthError(error.message);
+      setAuthLoading(false);
+    }
   }
 
-  async function sendMessage(text: string, image = chatImage) {
-    const body = text || (image ? "Image" : "");
+  async function signOut() {
+    const supabase = getSupabaseBrowserClient();
+    if (!supabase) {
+      setNotice({ kind: "error", text: "Supabase is not configured." });
+      return;
+    }
+    const { error } = await supabase.auth.signOut();
+    if (error) {
+      setNotice({ kind: "error", text: `Could not sign out: ${error.message}` });
+      return;
+    }
+    setNotice({ kind: "success", text: "You have signed out." });
+  }
+
+  async function sendMessage(text: string) {
+    if (!isSupabaseConfigured()) {
+      setChatError("Configure Supabase before sending shared messages.");
+      return;
+    }
+    if (!currentUser) {
+      setAuthOpen(true);
+      setChatError("Sign in to send a message.");
+      return;
+    }
+    const body = text;
     const parsed = messageDraftSchema.safeParse({ body });
     if (!parsed.success) {
       setChatError(parsed.error.issues.map((issue) => issue.message).join(" "));
@@ -568,43 +967,57 @@ export default function Home() {
     }
 
     try {
+      const response = await fetch("/api/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ city: citySlug, channel: channelId, body: parsed.data.body }),
+      });
+      if (!response.ok) {
+        const result = await response.json().catch(() => ({}));
+        throw new Error(typeof result.error === "string" ? result.error : "Could not send your message.");
+      }
+      const result = await response.json();
       const key = `${citySlug}:${channelId}`;
       setMessages((current) => ({
         ...current,
-        [key]: [...(current[key] ?? []), { id: makeId("message"), body: image && !text ? "" : parsed.data.body, time: "Just now", fromYou: true, image: image ?? undefined }],
+        [key]: [...(current[key] ?? []), {
+          id: result.message.id,
+          body: result.message.body,
+          time: result.message.time,
+          fromYou: true,
+          author: result.message.author,
+          author_username: result.message.author_username ?? null,
+          initials: result.message.initials,
+        }],
       }));
       setChatDraft("");
-      setChatImage(null);
       setChatError(null);
-      setNotice({ kind: "success", text: "Message added in this demo. It is not shared with other people." });
-    } catch {
-      setChatError("Your message could not be added to this preview. Please try again.");
+      setChatCooldown(true);
+      window.setTimeout(() => setChatCooldown(false), 3000);
+    } catch (error) {
+      setChatError(error instanceof Error ? error.message : "Your message could not be sent. Please try again.");
     }
   }
 
   function submitMessage(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (chatCooldown) return;
     const text = chatDraft.trim();
-    if (!text && !chatImage) return;
+    if (!text) return;
     if (includesPersonalInfo(text)) {
-      setPendingShare({ kind: "message", text, image: chatImage ?? undefined });
+      setPendingShare({ kind: "message", text });
       return;
     }
-    sendMessage(text);
+    void sendMessage(text);
   }
 
-  async function attachImages(files: FileList | null, purpose: Exclude<ImagePurpose, "avatar">) {
+  async function attachImages(files: FileList | null, purpose: "post") {
     if (!files?.length) return;
     const selectedFiles = Array.from(files);
     if (purpose === "post" && postImages.length + selectedFiles.length > 4) {
       setNotice({ kind: "error", text: "A post can include up to 4 images." });
       return;
     }
-    if (purpose === "chat" && selectedFiles.length > 1) {
-      setChatError("Attach one image per chat message.");
-      return;
-    }
-
     for (const file of selectedFiles) {
       try {
         const processed = await processImage(file, purpose);
@@ -616,57 +1029,20 @@ export default function Home() {
           size: processed.blob.size,
           width: processed.width,
           height: processed.height,
+          blob: processed.blob,
         };
-        if (purpose === "post") setPostImages((current) => [...current, localImage]);
-        else {
-          setChatImage((current) => {
-            if (current) {
-              URL.revokeObjectURL(current.url);
-              imageUrls.current.delete(current.url);
-            }
-            return localImage;
-          });
-        }
+        setPostImages((current) => [...current, localImage]);
       } catch (error) {
         const message = error instanceof Error ? error.message : "Image processing failed. Please try another image.";
-        if (purpose === "post") setNotice({ kind: "error", text: message });
-        else setChatError(message);
+        setNotice({ kind: "error", text: message });
       }
     }
   }
 
   function removeLocalImage(image: LocalImage) {
-    URL.revokeObjectURL(image.url);
+    if (image.url.startsWith("blob:")) URL.revokeObjectURL(image.url);
     imageUrls.current.delete(image.url);
     setPostImages((current) => current.filter((item) => item.url !== image.url));
-    setChatImage((current) => current?.url === image.url ? null : current);
-    setAvatarImage((current) => current?.url === image.url ? null : current);
-  }
-
-  async function attachAvatar(file: File | undefined) {
-    if (!file) return;
-    try {
-      const processed = await processImage(file, "avatar");
-      const url = URL.createObjectURL(processed.blob);
-      imageUrls.current.add(url);
-      const nextImage = {
-        url,
-        name: file.name,
-        size: processed.blob.size,
-        width: processed.width,
-        height: processed.height,
-      };
-      setAvatarImage((current) => {
-        if (current) {
-          URL.revokeObjectURL(current.url);
-          imageUrls.current.delete(current.url);
-        }
-        return nextImage;
-      });
-      setAvatarError(null);
-    } catch (error) {
-      setAvatarError(error instanceof Error ? error.message : "Avatar processing failed. Please try another image.");
-    }
   }
 
   function handleComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
@@ -676,38 +1052,46 @@ export default function Home() {
     }
   }
 
-  function handleFriendsTouchStart(event: TouchEvent<HTMLDivElement>) {
-    friendTouchStartY.current = event.touches[0]?.clientY ?? null;
-  }
-
-  function handleFriendsTouchEnd(event: TouchEvent<HTMLDivElement>) {
-    const startY = friendTouchStartY.current;
-    const endY = event.changedTouches[0]?.clientY;
-    friendTouchStartY.current = null;
-    if (startY !== null && endY !== undefined && endY - startY > 60) {
-      setVoiceChatOpen(true);
-    }
-  }
-
   async function addComment(postId: string, text: string, parentId?: string) {
+    if (!isSupabaseConfigured()) {
+      setNotice({ kind: "error", text: "Configure Supabase to publish shared comments." });
+      return;
+    }
+    if (!currentUser) {
+      setAuthOpen(true);
+      setNotice({ kind: "error", text: "Sign in to comment." });
+      return;
+    }
     const parsed = commentDraftSchema.safeParse({ body: text });
     if (!parsed.success) {
       setNotice({ kind: "error", text: parsed.error.issues.map((issue) => issue.message).join(" ") });
       return;
     }
 
-    const validationError = await validateOnServer("/api/comments/validate", parsed.data, "comment");
-    if (validationError) {
-      setNotice({ kind: "error", text: validationError });
-      return;
+    let comment: CommentItem;
+    try {
+        const response = await fetch(`/api/posts/${encodeURIComponent(postId)}/comments`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ body: parsed.data.body, parentId: parentId ?? null }),
+        });
+        const result: unknown = await response.json();
+        if (!response.ok) {
+          const message = typeof result === "object" && result !== null && "error" in result && typeof result.error === "string"
+            ? result.error
+            : "Could not publish your comment. Please try again.";
+          throw new Error(message);
+        }
+        const parsedResult = commentResponseSchema.safeParse(result);
+        if (!parsedResult.success) {
+          throw new Error("The server returned an invalid comment response.");
+        }
+        comment = { ...parsedResult.data.comment, replies: [] };
+    } catch (error) {
+        setNotice({ kind: "error", text: error instanceof Error ? error.message : "Could not publish your comment." });
+        return;
     }
 
-    const comment: CommentItem = {
-      id: makeId("comment"),
-      author: "You",
-      body: parsed.data.body,
-      replies: [],
-    };
     setPosts((current) =>
       current.map((post) => {
         if (post.id !== postId) return post;
@@ -722,7 +1106,39 @@ export default function Home() {
     setCommentDrafts((current) => ({ ...current, [postId]: "" }));
     setReplyDraft("");
     setReplyingTo(null);
-    setNotice({ kind: "success", text: "Reply added in this demo." });
+    setNotice({ kind: "success", text: "Comment published." });
+  }
+
+  async function votePost(postId: string, selectedVote: -1 | 1) {
+    const nextVote = votes[postId] === selectedVote ? 0 : selectedVote;
+    if (!isSupabaseConfigured() || !currentUser) {
+      if (!currentUser) setAuthOpen(true);
+      setNotice({ kind: "error", text: "Configure Supabase and sign in to vote on posts." });
+      return;
+    }
+    try {
+      const response = await fetch(`/api/posts/${encodeURIComponent(postId)}/votes`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ vote: nextVote }),
+      });
+      const result: unknown = await response.json();
+      if (!response.ok) {
+        const message = typeof result === "object" && result !== null && "error" in result && typeof result.error === "string"
+          ? result.error
+          : "Could not save your vote. Please try again.";
+        throw new Error(message);
+      }
+      if (typeof result !== "object" || result === null || !("score" in result) || !("vote" in result)) {
+        throw new Error("The server returned an invalid vote response.");
+      }
+      setPosts((current) => current.map((post) => post.id === postId
+        ? { ...post, votes: Number(result.score) }
+        : post));
+      setVotes((current) => ({ ...current, [postId]: Number(result.vote) }));
+    } catch (error) {
+      setNotice({ kind: "error", text: error instanceof Error ? error.message : "Could not save your vote." });
+    }
   }
 
   function submitComment(event: FormEvent<HTMLFormElement>, postId: string, text: string, parentId?: string) {
@@ -740,7 +1156,7 @@ export default function Home() {
     if (!pendingShare) return;
     const share = pendingShare;
     setPendingShare(null);
-    if (share.kind === "message") sendMessage(share.text, share.image);
+    if (share.kind === "message") void sendMessage(share.text);
     if (share.kind === "comment" && share.postId) addComment(share.postId, share.text, share.parentId);
     if (share.kind === "post") {
       const [title, ...body] = share.text.split("\n");
@@ -749,9 +1165,7 @@ export default function Home() {
   }
 
   function renderComments(comments: CommentItem[], postId: string, depth = 0): ReactNode {
-    return comments.filter((comment) =>
-      !blockedAuthors.includes(comment.author) && !bannedAuthors.includes(comment.author),
-    ).map((comment) => (
+    return comments.filter((comment) => !comment.author_username || !blockedUsernames.has(comment.author_username)).map((comment) => (
       <div className="comment" key={comment.id} style={{ marginLeft: Math.min(depth, 3) * 16 }}>
         <div className="comment-line">
           <span className="avatar avatar-small">{initials(comment.author)}</span>
@@ -764,11 +1178,16 @@ export default function Home() {
             type: "comment",
             id: comment.id,
             author: comment.author,
+            authorUsername: comment.author_username,
             label: `comment by ${comment.author}`,
+            targetContent: comment.body,
           })}>Report</button>
-          {comment.author !== "You" && (
-            <button className="text-button" type="button" onClick={() => blockAuthor(comment.author)}>
-              {blockedAuthors.includes(comment.author) ? "Blocked" : "Block"}
+          {comment.author_username && (
+            <button className="text-button" type="button" onClick={() => void updateBlock(
+              comment.author_username!,
+              !blockedUsernames.has(comment.author_username!),
+            )}>
+              {blockedUsernames.has(comment.author_username) ? "Unblock" : "Block"}
             </button>
           )}
         </div>
@@ -794,22 +1213,34 @@ export default function Home() {
 
   return (
     <>
-    <div className={`app-shell ${mobileView === "chat" ? "mobile-chat-mode" : ""}`} inert={ageGateOpen}>
+    <div className={`app-shell ${mobileView === "chat" ? "mobile-chat-mode" : ""}`}>
       <aside className="sidebar" aria-label="VibeChat navigation">
         <SiteBrand />
         <div className="sidebar-label-row">
           <h2>Your cities</h2>
-          <span className="demo-label">Demo</span>
+          <span className="subtle">Saved on this device</span>
         </div>
-        <label className="sr-only" htmlFor="city-search">Search cities</label>
-        <input
-          id="city-search"
-          className="search-input"
-          value={citySearch}
-          onChange={(event) => setCitySearch(event.target.value)}
-          placeholder="Find a city"
-          type="search"
-        />
+        <div className="search-wrap">
+          <label className="sr-only" htmlFor="city-search">Search cities</label>
+          <input
+            id="city-search"
+            className="search-input"
+            value={citySearch}
+            onChange={(event) => setCitySearch(event.target.value)}
+            placeholder="Find a city"
+            type="search"
+          />
+          {citySearch.trim() && (
+            <button
+              className="button button-small search-clear"
+              type="button"
+              onClick={() => setCitySearch("")}
+              aria-label="Clear city search"
+            >
+              ×
+            </button>
+          )}
+        </div>
         {citySearch.trim() && (
           <div className="city-results" role="list" aria-label="City search results">
             {cityMatches.length ? cityMatches.map((item) => (
@@ -855,8 +1286,32 @@ export default function Home() {
             })}
         </nav>
         <div className="sidebar-bottom">
-          <p>One account for every city. Google sign-in arrives in Phase 2.</p>
-          <button className="button sign-in-button" type="button" onClick={() => setAuthOpen(true)}>Sign in</button>
+          {currentUser && profile ? (
+            <>
+              <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
+                {profile.avatar_url ? (
+                  <Image src={profile.avatar_url} alt="Avatar" width={28} height={28} unoptimized style={{ width: 28, height: 28, borderRadius: 50, objectFit: "cover", border: "1px solid #4b4c3f" }} />
+                ) : (
+                  <span style={{
+                    width: 28, height: 28, borderRadius: 50, background: "#303126", color: "#e1c37f",
+                    fontSize: 10, fontWeight: 700, display: "grid", placeItems: "center", flex: "none",
+                    border: "1px solid #4b4c3f",
+                  }}>{(profile.display_name || profile.username).split(/[_\s]+/).map((p: string) => p[0]).filter(Boolean).slice(0, 2).join("").toUpperCase() || "?"}</span>
+                )}
+                <div style={{ minWidth: 0 }}>
+                  <strong style={{ display: "block", fontSize: 13, color: "#e7e5de" }}>{profile.display_name || profile.username}</strong>
+                  {profile.tag && <span style={{ fontSize: 11, color: "#a0a699", background: "#22251f", border: "1px solid #343830", borderRadius: 4, padding: "0 6px" }}>{profile.tag}</span>}
+                </div>
+              </div>
+            </>
+          ) : (
+            <p>{currentUser ? `Signed in as ${currentUser.email ?? "Google account"}.` : "Sign in with Google to publish posts shared with the community."}</p>
+          )}
+          {currentUser ? (
+            <button className="button sign-in-button" type="button" onClick={() => void signOut()}>Sign out</button>
+          ) : (
+            <button className="button sign-in-button" type="button" onClick={() => setAuthOpen(true)}>Sign in</button>
+          )}
           <div className="legal-links"><Link href="/privacy">Privacy</Link><Link href="/terms">Terms</Link></div>
         </div>
       </aside>
@@ -865,21 +1320,35 @@ export default function Home() {
         <header className="topbar">
           <div className="breadcrumbs"><span>Community</span><span aria-hidden="true">/</span><strong>{city.name}</strong></div>
           <div className="topbar-actions">
-            <label className="sr-only" htmlFor="post-search">Search posts in {city.name}</label>
-            <input
-              id="post-search"
-              className="search-input post-search"
-              value={postSearch}
-              onChange={(event) => setPostSearch(event.target.value)}
-              placeholder="Search this board"
-              type="search"
-            />
+            <div className="search-wrap">
+              <label className="sr-only" htmlFor="post-search">Search posts in {city.name}</label>
+              <input
+                id="post-search"
+                className="search-input post-search"
+                value={postSearch}
+                onChange={(event) => setPostSearch(event.target.value)}
+                placeholder="Search this board"
+                type="search"
+              />
+              {postSearch.trim() && (
+                <button
+                  className="button button-small search-clear"
+                  type="button"
+                  onClick={() => setPostSearch("")}
+                  aria-label="Clear post search"
+                >
+                  ×
+                </button>
+              )}
+            </div>
             <button className="button safety-center-button" type="button" onClick={() => setSafetyCenterOpen(true)}>
               Safety{ safetyReports.filter((report) => report.status === "open").length > 0
                 ? ` · ${safetyReports.filter((report) => report.status === "open").length}`
                 : ""}
             </button>
-            <button className="button sign-in-mobile" type="button" onClick={() => setAuthOpen(true)}>Sign in</button>
+            <button className="button sign-in-mobile" type="button" onClick={() => setAuthOpen(true)}>
+              {currentUser ? "Account" : "Sign in"}
+            </button>
           </div>
         </header>
 
@@ -900,27 +1369,6 @@ export default function Home() {
 
         <div className="board-layout">
           <section className="feed-column" aria-labelledby="board-title">
-            <section className="stories-section" aria-label="Community stories">
-              <div className="stories-heading">
-                <h2>Community stories</h2>
-                <span className="subtle">Demo previews</span>
-              </div>
-              <div className="stories-list">
-                {DEMO_STORIES.map((story) => (
-                  <button
-                    className="story-button"
-                    key={story.id}
-                    type="button"
-                    aria-label={`View demo story by ${story.name} from ${story.city}`}
-                    onClick={() => setActiveStory(story)}
-                  >
-                    <span className="story-ring"><span className="story-avatar">{story.initials}</span></span>
-                    <span className="story-name">{story.name}</span>
-                  </button>
-                ))}
-              </div>
-            </section>
-
             <div className="board-heading">
               <div>
                 <p className="eyebrow">{city.slug === "general" ? "Open community" : `${city.region} community`}</p>
@@ -994,10 +1442,16 @@ export default function Home() {
 
             <div className="feed-toolbar">
               <h2>Latest posts</h2>
-              <span className="subtle">Examples are mock content</span>
+              <span className="subtle">{isSupabaseConfigured() ? "Community posts" : "Connect Supabase to load community posts"}</span>
             </div>
 
-            {loading ? (
+            {postsError ? (
+              <div className="empty-state card" role="alert">
+                <h2>Posts could not be loaded</h2>
+                <p>{postsError}</p>
+                <button className="button" type="button" onClick={() => setPostsRefresh((value) => value + 1)}>Try again</button>
+              </div>
+            ) : loading ? (
               <div className="card loading-card" role="status" aria-label="Loading posts">
                 <span className="skeleton skeleton-short" /><span className="skeleton" /><span className="skeleton skeleton-long" />
                 <span className="skeleton skeleton-short" /><span className="skeleton" />
@@ -1013,11 +1467,15 @@ export default function Home() {
               <div className="post-list">
                 {visiblePosts.map((post) => {
                   const expanded = expandedPosts.includes(post.id);
-                  const score = post.votes + (votes[post.id] ?? 0);
+                  const score = post.votes + (isSupabaseConfigured() ? 0 : votes[post.id] ?? 0);
                   return (
                     <article className="card post-card" key={post.id}>
                       <div className="post-meta">
-                        <span className="avatar">{post.initials}</span>
+                        {post.avatar_url ? (
+                          <Image className="avatar" src={post.avatar_url} alt="Avatar" width={34} height={34} unoptimized />
+                        ) : (
+                          <span className="avatar">{post.initials}</span>
+                        )}
                         <div className="author-line"><strong>{post.author}</strong><span>{post.time}</span></div>
                         <span className="tag">{post.tag}</span>
                         <details className="post-menu">
@@ -1027,15 +1485,17 @@ export default function Home() {
                               type: "post",
                               id: post.id,
                               author: post.author,
+                              authorUsername: post.author_username,
                               label: `post by ${post.author}`,
+                              targetContent: `${post.title}\n${post.body}`,
                             })}>Report post</button>
-                            {!post.mine && <button type="button" onClick={() => blockAuthor(post.author)}>
-                              {blockedAuthors.includes(post.author) ? "Block again" : "Block author"}
-                            </button>}
-                            {post.mine && <button type="button" onClick={() => {
-                              post.images?.forEach(removeLocalImage);
-                              setPosts((current) => current.filter((item) => item.id !== post.id));
-                            }}>Delete post</button>}
+                              {!post.mine && post.author_username && <button type="button" onClick={() => void updateBlock(
+                                post.author_username!,
+                                !blockedUsernames.has(post.author_username!),
+                              )}>
+                                {blockedUsernames.has(post.author_username) ? "Unblock author" : "Block author"}
+                              </button>}
+                            {post.mine && <button type="button" onClick={() => void deletePost(post)}>Delete post</button>}
                           </div>
                         </details>
                       </div>
@@ -1062,9 +1522,9 @@ export default function Home() {
                       )}
                       <div className="post-actions">
                         <div className="vote-control" aria-label={`Vote score ${score}`}>
-                          <button className="icon-button" type="button" aria-label="Upvote post" aria-pressed={votes[post.id] === 1} onClick={() => setVotes((current) => ({ ...current, [post.id]: current[post.id] === 1 ? 0 : 1 }))}>↑</button>
+                          <button className="icon-button" type="button" aria-label="Upvote post" aria-pressed={votes[post.id] === 1} onClick={() => void votePost(post.id, 1)}>↑</button>
                           <span>{score}</span>
-                          <button className="icon-button" type="button" aria-label="Downvote post" aria-pressed={votes[post.id] === -1} onClick={() => setVotes((current) => ({ ...current, [post.id]: current[post.id] === -1 ? 0 : -1 }))}>↓</button>
+                          <button className="icon-button" type="button" aria-label="Downvote post" aria-pressed={votes[post.id] === -1} onClick={() => void votePost(post.id, -1)}>↓</button>
                         </div>
                         <button className="text-button" type="button" onClick={() => setExpandedPosts((current) => current.includes(post.id) ? current.filter((id) => id !== post.id) : [...current, post.id])}>
                           {expanded ? "Hide replies" : `${post.comments.length} comments`}
@@ -1086,37 +1546,10 @@ export default function Home() {
                 })}
               </div>
             )}
-            <footer className="page-footer"><span>VibeChat · Frontend preview</span><span><Link href="/privacy">Privacy</Link><Link href="/terms">Terms</Link></span></footer>
+            <footer className="page-footer"><span>VibeChat · Community posts and chat</span><span><Link href="/privacy">Privacy</Link><Link href="/terms">Terms</Link></span></footer>
           </section>
 
           <section className="chat-panel" aria-label={`${city.name} chat`}>
-            <div className="mobile-friends-bar" onTouchStart={handleFriendsTouchStart} onTouchEnd={handleFriendsTouchEnd}>
-              <div className="mobile-friends-title">
-                <strong>Friends</strong>
-                <span>Demo preview</span>
-              </div>
-              <div className="mobile-friends-list" aria-label="Demo friends">
-                {DEMO_FRIENDS.map((friend) => (
-                  <button
-                    className={`mobile-friend ${activeFriendId === friend.id ? "mobile-friend-active" : ""}`}
-                    key={friend.id}
-                    type="button"
-                    aria-label={`${friend.name}, ${friend.online ? "online" : "offline"}, demo friend`}
-                    aria-pressed={activeFriendId === friend.id}
-                    onClick={() => setActiveFriendId(friend.id)}
-                  >
-                    <span className="mobile-friend-avatar">{friend.initials}</span>
-                    <span className={`online-indicator ${friend.online ? "is-online" : ""}`} aria-hidden="true" />
-                    <span className="mobile-friend-name">{friend.name}</span>
-                  </button>
-                ))}
-              </div>
-              <p className="voice-swipe-hint">Swipe down to open voice chat</p>
-              <span className="sr-only" role="status" aria-live="polite">
-                {activeFriend ? `${activeFriend.name} selected. Direct messaging is not connected in this preview.` : ""}
-              </span>
-            </div>
-
             <header className="mobile-chat-heading">
               <h1>{city.slug === "general" ? "General Chat" : `${city.name} Chat`}</h1>
               <button
@@ -1131,7 +1564,7 @@ export default function Home() {
 
             <div className="chat-heading desktop-chat-heading">
               <div><p className="eyebrow">Community chat</p><h2>{city.name}</h2></div>
-              <span className="demo-status"><span />Preview</span>
+              <span className="demo-status"><span />{isSupabaseConfigured() ? "Shared messages" : "Supabase setup required"}</span>
             </div>
             <div className="channel-list" role="tablist" aria-label="Chat channels">
               {channels.map((channel) => (
@@ -1199,54 +1632,36 @@ export default function Home() {
             </nav>
 
             <div className="chat-log" ref={chatLogRef} role="log" aria-live="polite" aria-relevant="additions text" aria-label="Conversation">
-              {loading ? (
+              {chatLoading && currentMessages.length === 0 ? (
                 <div className="chat-loading" role="status">Loading conversation…</div>
+              ) : chatLoadError && currentMessages.length === 0 ? (
+                <div className="chat-empty" role="alert">
+                  <h3>Chat is unavailable</h3>
+                  <p>{chatLoadError}</p>
+                </div>
               ) : currentMessages.length === 0 ? (
                 <div className="chat-empty">
                   <h3>No messages yet</h3>
                   <p>Start a conversation in {channels.find((channel) => channel.id === channelId)?.label}.</p>
-                  <p className="subtle">This is a local preview. Messages are not sent to a server.</p>
                 </div>
               ) : currentMessages.map((message) => (
                 <article className={`chat-message ${message.fromYou ? "chat-message-own" : ""}`} key={message.id}>
-                  {!message.fromYou && <span className="avatar avatar-small">MK</span>}
+                  {!message.fromYou && <span className="avatar avatar-small">{message.initials}</span>}
                   <div className="message-content">
-                    <div className="message-meta"><strong>{message.fromYou ? "You" : "Friend"}</strong><time>{message.time}</time></div>
+                    <div className="message-meta"><strong>{message.fromYou ? "You" : message.author}</strong><time>{message.time}</time></div>
                     {message.body && <p>{message.body}</p>}
-                    {message.image && <Image className="chat-image" src={message.image.url} alt={message.image.name} width={message.image.width} height={message.image.height} unoptimized />}
                   </div>
-                  {message.fromYou && <span className="avatar avatar-small">YO</span>}
+                  {message.fromYou && <span className="avatar avatar-small">{message.initials}</span>}
                 </article>
               ))}
             </div>
             <form className="chat-form" onSubmit={submitMessage}>
               <label className="sr-only" htmlFor="chat-message">Message Chat-Chaat</label>
               <textarea id="chat-message" value={chatDraft} onKeyDown={handleComposerKeyDown} onChange={(event) => setChatDraft(event.target.value)} placeholder="Message Chat-Chaat…" maxLength={2000} rows={2} enterKeyHint="send" />
-              <div className="image-attachments">
-                <label className="button button-small" htmlFor="chat-image">Attach image</label>
-                <input
-                  className="image-file-input"
-                  id="chat-image"
-                  type="file"
-                  accept="image/jpeg,image/png,image/webp"
-                  onChange={(event) => {
-                    void attachImages(event.currentTarget.files, "chat");
-                    event.currentTarget.value = "";
-                  }}
-                />
-                <span className="subtle">JPEG, PNG or WebP · up to 5 MB · compressed to WebP, max 1600 px / 1.5 MB</span>
-              </div>
-              {chatImage && (
-                <div className="chat-image-preview">
-                  <Image src={chatImage.url} alt={chatImage.name} width={chatImage.width} height={chatImage.height} unoptimized />
-                  <span className="subtle">{chatImage.width}×{chatImage.height} · {(chatImage.size / (1024 * 1024)).toFixed(2)} MB</span>
-                  <button className="text-button" type="button" onClick={() => removeLocalImage(chatImage)}>Remove</button>
-                </div>
-              )}
               {chatError && <p className="chat-error" role="alert">{chatError}</p>}
               <div className="chat-form-footer">
-                <span className="subtle">Preview only · Enter to send · Shift+Enter for a new line</span>
-                <button className="button button-primary button-small" type="submit" disabled={!chatDraft.trim() && !chatImage}>Send</button>
+                <span className="subtle">Shared with this channel · Enter to send · Shift+Enter for a new line</span>
+                <button className="button button-primary button-small" type="submit" disabled={chatCooldown || !chatDraft.trim()}>{chatCooldown ? "Wait 3s…" : "Send"}</button>
               </div>
             </form>
           </section>
@@ -1257,32 +1672,23 @@ export default function Home() {
         <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setAuthOpen(false); }}>
           <section className="modal" role="dialog" aria-modal="true" aria-labelledby="auth-title">
             <button className="modal-close" type="button" onClick={() => setAuthOpen(false)} aria-label="Close sign-in dialog">×</button>
-            <p className="eyebrow">Account</p><h2 id="auth-title">Google sign-in is coming in Phase 2</h2>
-            <p>This preview does not create accounts or connect to Google. The planned account will work across cities and include a username, avatar, and home city.</p>
-            <div className="image-attachments">
-              <label className="button button-small" htmlFor="avatar-image">Choose local avatar preview</label>
-              <input
-                className="image-file-input"
-                id="avatar-image"
-                type="file"
-                accept="image/jpeg,image/png,image/webp"
-                onChange={(event) => {
-                  void attachAvatar(event.currentTarget.files?.[0]);
-                  event.currentTarget.value = "";
-                }}
-              />
-              <span className="subtle">JPEG, PNG or WebP · up to 1 MB · compressed to WebP, max 512×512</span>
-            </div>
-            {avatarError && <p className="chat-error" role="alert">{avatarError}</p>}
-            {avatarImage && (
-              <div className="avatar-preview">
-                <Image className="avatar" src={avatarImage.url} alt="Local avatar preview" width={avatarImage.width} height={avatarImage.height} unoptimized />
-                <span className="subtle">{avatarImage.width}×{avatarImage.height} · {(avatarImage.size / (1024 * 1024)).toFixed(2)} MB · not uploaded</span>
-                <button className="text-button" type="button" onClick={() => removeLocalImage(avatarImage)}>Remove avatar</button>
-              </div>
+            <p className="eyebrow">Account</p>
+            <h2 id="auth-title">{currentUser ? "Your account" : "Sign in with Google"}</h2>
+            <p>{currentUser
+              ? `You are signed in as ${currentUser.email ?? "your Google account"}.`
+              : "Google sign-in is used to publish and manage your community posts. VibeChat does not receive your Google password."}</p>
+            {!currentUser && (
+              <button className="button button-primary" type="button" onClick={() => void signInWithGoogle()} disabled={authLoading}>
+                {authLoading ? "Redirecting to Google…" : "Continue with Google"}
+              </button>
             )}
-            <p>Access to this 18+ preview requires confirming your age at the entry gate.</p>
-            <button className="button button-primary" type="button" onClick={() => setAuthOpen(false)}>Close</button>
+            {authError && <p className="chat-error" role="alert">{authError}</p>}
+            {currentUser && <Link className="button" href="/profile">Edit your profile and avatar</Link>}
+            <p>Access requires confirming that you are 18 or older at the entry gate.</p>
+            <div className="modal-actions">
+              {currentUser && <button className="button" type="button" onClick={() => void signOut()}>Sign out</button>}
+              <button className="button" type="button" onClick={() => setAuthOpen(false)}>Close</button>
+            </div>
           </section>
         </div>
       )}
@@ -1291,8 +1697,8 @@ export default function Home() {
         <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setReportTarget(null); }}>
           <form className="modal" role="dialog" aria-modal="true" aria-labelledby="report-title" onSubmit={submitReport}>
             <button className="modal-close" type="button" onClick={() => setReportTarget(null)} aria-label="Close report dialog">×</button>
-            <p className="eyebrow">Community safety · Preview</p><h2 id="report-title">Report {reportTarget.label}</h2>
-            <p>Choose a reason. The report stays in this page and is not sent to a moderator.</p>
+            <p className="eyebrow">Community safety</p><h2 id="report-title">Report {reportTarget.label}</h2>
+            <p>Reports are shared with authorized community safety moderators.</p>
             <label htmlFor="report-reason">Reason</label>
             <select id="report-reason" value={reportReason} onChange={(event) => setReportReason(event.target.value)} required>
               <option value="">Choose a reason</option>
@@ -1306,9 +1712,16 @@ export default function Home() {
             <label htmlFor="report-details">Additional details (optional)</label>
             <textarea id="report-details" value={reportDetails} onChange={(event) => setReportDetails(event.target.value)} maxLength={500} placeholder="Share only what helps explain the concern." rows={3} />
             <div className="modal-actions">
-              {reportTarget.author !== "You" && (
-                <button className="button" type="button" onClick={() => { blockAuthor(reportTarget.author); setReportTarget(null); }}>
-                  Block {reportTarget.author}
+              {reportTarget.authorUsername && (
+                <button
+                  className="button"
+                  type="button"
+                  onClick={() => {
+                    void updateBlock(reportTarget.authorUsername!, !blockedUsernames.has(reportTarget.authorUsername!));
+                    setReportTarget(null);
+                  }}
+                >
+                  {blockedUsernames.has(reportTarget.authorUsername) ? "Unblock author" : "Block author"}
                 </button>
               )}
               <button className="button button-primary" type="submit" disabled={!reportReason}>Submit report</button>
@@ -1321,13 +1734,15 @@ export default function Home() {
         <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setSafetyCenterOpen(false); }}>
           <section className="modal safety-modal" role="dialog" aria-modal="true" aria-labelledby="safety-title">
             <button className="modal-close" type="button" onClick={() => setSafetyCenterOpen(false)} aria-label="Close safety center">×</button>
-            <p className="eyebrow">Community safety · Local preview</p>
+            <p className="eyebrow">Community safety</p>
             <h2 id="safety-title">Safety center</h2>
-            <p>Reports, blocks, and bans here affect only this browser preview. There is no moderator account or live enforcement yet.</p>
+            <p>{moderatorView
+              ? "Moderator queue. Only accounts with the trusted moderator role can review and update reports."
+              : "Your reports are saved privately to your account for review by community safety moderators."}</p>
             <section className="safety-section" aria-labelledby="reports-heading">
-              <h3 id="reports-heading">Report queue ({safetyReports.filter((report) => report.status === "open").length} open)</h3>
+              <h3 id="reports-heading">{moderatorView ? "Moderation queue" : "Your reports"} ({safetyReports.length})</h3>
               {safetyReports.length === 0 ? (
-                <p className="subtle">No preview reports yet.</p>
+                <p className="subtle">You have not submitted a report.</p>
               ) : (
                 <div className="safety-list">
                   {safetyReports.map((report) => (
@@ -1335,16 +1750,19 @@ export default function Home() {
                       <div>
                         <strong>{report.label}</strong>
                         <span>{report.reason.replaceAll("-", " ")} · {report.status}</span>
+                        {report.targetContent && <p>{report.targetContent}</p>}
                         {report.details && <p>{report.details}</p>}
                       </div>
-                      {report.status === "open" && (
+                      {moderatorView && report.status !== "actioned" && (
                         <div className="safety-actions">
-                          <button className="button button-small" type="button" onClick={() => dismissReport(report.reportId)}>Dismiss</button>
-                          {report.author !== "You" && (
-                            <button className="button button-small button-danger" type="button" onClick={() => banAuthor(report.author, report.reportId)}>
-                              Ban in preview
+                          {report.status === "open" && (
+                            <button className="button button-small" type="button" onClick={() => void moderateReport(report.reportId, "reviewed")}>
+                              Mark reviewed
                             </button>
                           )}
+                          <button className="button button-small button-danger" type="button" onClick={() => void moderateReport(report.reportId, "actioned")}>
+                            Mark actioned
+                          </button>
                         </div>
                       )}
                     </article>
@@ -1352,62 +1770,27 @@ export default function Home() {
                 </div>
               )}
             </section>
-            <section className="safety-section" aria-labelledby="blocked-heading">
-              <h3 id="blocked-heading">Blocked accounts ({blockedAuthors.length})</h3>
-              {blockedAuthors.length === 0 ? <p className="subtle">You have not blocked anyone in this preview.</p> : (
-                <div className="safety-list">
-                  {blockedAuthors.map((author) => (
-                    <div className="safety-item" key={author}>
-                      <strong>{author}</strong>
-                      <button className="button button-small" type="button" onClick={() => unblockAuthor(author)}>Unblock</button>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </section>
-            <section className="safety-section" aria-labelledby="banned-heading">
-              <h3 id="banned-heading">Preview bans ({bannedAuthors.length})</h3>
-              {bannedAuthors.length === 0 ? <p className="subtle">No preview bans.</p> : (
-                <div className="safety-list">
-                  {bannedAuthors.map((author) => (
-                    <div className="safety-item" key={author}>
-                      <strong>{author}</strong>
-                      <button className="button button-small" type="button" onClick={() => liftBan(author)}>Lift ban</button>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </section>
+            {!moderatorView && (
+              <section className="safety-section" aria-labelledby="blocked-heading">
+                <h3 id="blocked-heading">Blocked accounts ({blockedAuthors.length})</h3>
+                {blockedAuthors.length === 0 ? <p className="subtle">You have not blocked anyone.</p> : (
+                  <div className="safety-list">
+                    {blockedAuthors.map((account) => (
+                      <div className="safety-item" key={account.username}>
+                        <strong>{account.name}</strong>
+                        <button className="button button-small" type="button" onClick={() => void updateBlock(account.username, false)}>Unblock</button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </section>
+            )}
             <button className="button button-primary" type="button" onClick={() => setSafetyCenterOpen(false)}>Done</button>
           </section>
         </div>
       )}
 
     </div>
-
-      {ageGateOpen && (
-        <div className="modal-backdrop age-gate-backdrop">
-          <section className="modal age-gate-modal" role="alertdialog" aria-modal="true" aria-labelledby="age-gate-title">
-            <p className="eyebrow">Age check · Required</p>
-            <h2 id="age-gate-title">VibeChat is for adults 18+</h2>
-            <p>You must be 18 or older to enter this preview. We store only your confirmation in this browser; we do not ask for your birth date or ID.</p>
-            {ageGateDenied && <p className="age-gate-error" role="alert">You cannot continue to VibeChat if you are under 18.</p>}
-            <label className="age-confirm">
-              <input type="checkbox" checked={ageGateChecked} onChange={(event) => {
-                const confirmed = event.target.checked;
-                setAgeGateChecked(confirmed);
-                setAgeGateDenied(false);
-                if (confirmed) confirmAgeGate(true);
-              }} />
-              I confirm that I am 18 years of age or older.
-            </label>
-            <button className="button button-primary" type="button" disabled={!ageGateChecked} onClick={() => confirmAgeGate()}>Continue to VibeChat</button>
-            <button className="text-button age-gate-underage" type="button" onClick={() => { setAgeGateChecked(false); setAgeGateDenied(true); }}>
-              I am under 18
-            </button>
-          </section>
-        </div>
-      )}
 
       {pendingShare && (
         <div className="modal-backdrop" role="presentation">
@@ -1422,31 +1805,6 @@ export default function Home() {
         </div>
       )}
 
-      {activeStory && (
-        <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setActiveStory(null); }}>
-          <section className="modal story-modal" role="dialog" aria-modal="true" aria-labelledby="story-title">
-            <button className="modal-close" type="button" onClick={() => setActiveStory(null)} aria-label="Close story">×</button>
-            <div className="story-modal-author">
-              <span className="story-ring"><span className="story-avatar">{activeStory.initials}</span></span>
-              <div><strong id="story-title">{activeStory.name}</strong><span>{activeStory.city} · Demo story</span></div>
-            </div>
-            <p>{activeStory.text}</p>
-            <button className="button button-primary" type="button" onClick={() => setActiveStory(null)}>Done</button>
-          </section>
-        </div>
-      )}
-
-      {voiceChatOpen && (
-        <div className="modal-backdrop voice-chat-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setVoiceChatOpen(false); }}>
-          <section className="modal voice-chat-modal" role="dialog" aria-modal="true" aria-labelledby="voice-chat-title">
-            <button className="modal-close" type="button" onClick={() => setVoiceChatOpen(false)} aria-label="Close voice chat preview">×</button>
-            <p className="eyebrow">Voice chat</p>
-            <h2 id="voice-chat-title">Voice chat preview</h2>
-            <p>Voice chat is not connected in this preview. Your microphone is not accessed.</p>
-            <button className="button button-primary" type="button" onClick={() => setVoiceChatOpen(false)}>Got it</button>
-          </section>
-        </div>
-      )}
     </>
   );
 }

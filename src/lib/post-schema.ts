@@ -17,6 +17,17 @@ export const postDraftSchema = z.object({
   tag: postTagSchema,
 }).strict();
 
+export const postImagePathSchema = z.string()
+  .regex(
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.webp$/i,
+    "Post images must be compressed WebP files.",
+  );
+
+export const postCreateRequestSchema = z.object({
+  post: postDraftSchema,
+  imagePaths: z.array(postImagePathSchema).max(4, "A post can include up to 4 images."),
+}).strict();
+
 export const postEditSchema = postDraftSchema.pick({ title: true, body: true }).strict();
 
 export const commentDraftSchema = z.object({

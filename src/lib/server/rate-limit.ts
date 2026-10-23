@@ -3,11 +3,30 @@ import { NextResponse } from "next/server";
 
 const RATE_LIMITS = {
   posts: { limit: 5, windowMs: 60 * 60 * 1000 },
+  postValidation: { limit: 30, windowMs: 60 * 60 * 1000 },
+  postImages: { limit: 20, windowMs: 60 * 60 * 1000 },
   comments: { limit: 30, windowMs: 60 * 60 * 1000 },
+  votes: { limit: 60, windowMs: 60 * 60 * 1000 },
+  reports: { limit: 10, windowMs: 60 * 60 * 1000 },
+  blocks: { limit: 30, windowMs: 60 * 60 * 1000 },
   messages: { limit: 30, windowMs: 60 * 1000 },
+  profiles: { limit: 10, windowMs: 60 * 60 * 1000 },
+  avatars: { limit: 10, windowMs: 60 * 60 * 1000 },
 } as const;
 
 type RateLimitAction = keyof typeof RATE_LIMITS;
+const ACTION_LABELS: Record<RateLimitAction, string> = {
+  posts: "post publishing",
+  postValidation: "post validation",
+  postImages: "post image upload",
+  comments: "comment",
+  votes: "vote",
+  reports: "report",
+  blocks: "block",
+  messages: "message",
+  profiles: "profile save",
+  avatars: "avatar upload",
+};
 type RateLimitEntry = { count: number; expiresAt: number };
 
 const entries = new Map<string, RateLimitEntry>();
@@ -36,7 +55,7 @@ export function enforceRateLimit(request: Request, action: RateLimitAction) {
   if (entry && entry.expiresAt > now && entry.count >= policy.limit) {
     const retryAfter = Math.max(1, Math.ceil((entry.expiresAt - now) / 1000));
     return NextResponse.json(
-      { error: `Too many ${action} requests. Please try again in ${retryAfter} seconds.` },
+      { error: `Too many ${ACTION_LABELS[action]} requests. Please try again in ${retryAfter} seconds.` },
       { status: 429, headers: { "Retry-After": String(retryAfter) } },
     );
   }
