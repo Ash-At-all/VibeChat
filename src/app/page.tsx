@@ -47,7 +47,7 @@ type Post = {
   comments: CommentItem[];
   mine?: boolean;
 };
-type Message = { id: string; body: string; time: string; fromYou: boolean; author: string; author_username: string | null; initials: string };
+type Message = { id: string; body: string; time: string; fromYou: boolean; author: string; author_username: string | null; initials: string; delivery?: "sending" | "failed" };
 type Channel = { id: string; label: string };
 type SafetyTarget = { type: "post" | "comment"; id: string; author: string; authorUsername?: string | null; label: string; targetContent?: string };
 type BlockedAccount = { username: string; name: string };
@@ -185,7 +185,8 @@ export default function Home() {
   const [favourites, setFavourites] = useState<string[]>([]);
   const [citySlug, setCitySlug] = useState("general");
   const [channelId, setChannelId] = useState("chitchat");
-  const [mobileView, setMobileView] = useState<"board" | "chat">("chat");
+  const [mobileView, setMobileView] = useState<"board" | "chat">("board");
+  const [mobileCitiesOpen, setMobileCitiesOpen] = useState(false);
   const [citySearch, setCitySearch] = useState("");
   const [postSearch, setPostSearch] = useState("");
   const [posts, setPosts] = useState<Post[]>([]);
@@ -204,6 +205,8 @@ export default function Home() {
   const [postTag, setPostTag] = useState<PostTag>("General");
   const [chatDraft, setChatDraft] = useState("");
   const [chatCooldown, setChatCooldown] = useState(false);
+  const [chatSending, setChatSending] = useState(false);
+  const [isOnline, setIsOnline] = useState(true);
   const [commentDrafts, setCommentDrafts] = useState<Record<string, string>>({});
   const [replyDraft, setReplyDraft] = useState("");
   const [replyingTo, setReplyingTo] = useState<string | null>(null);
@@ -222,18 +225,56 @@ export default function Home() {
   const [pendingShare, setPendingShare] = useState<PendingShare | null>(null);
   const [notice, setNotice] = useState<{ kind: "error" | "success"; text: string } | null>(null);
   const [authOpen, setAuthOpen] = useState(false);
-  const [leftRailOpen, setLeftRailOpen] = useState(false);
-  const [rightRailOpen, setRightRailOpen] = useState(false);
   const [chatLoading, setChatLoading] = useState(false);
   const [chatLoadError, setChatLoadError] = useState<string | null>(null);
   const [chatError, setChatError] = useState<string | null>(null);
+  const [chatRefresh, setChatRefresh] = useState(0);
   const mainRef = useRef<HTMLElement>(null);
   const chatLogRef = useRef<HTMLDivElement>(null);
+  const chatInputRef = useRef<HTMLTextAreaElement>(null);
+  const postSearchRef = useRef<HTMLInputElement>(null);
+  const mobileCitySearchRef = useRef<HTMLInputElement>(null);
   const imageUrls = useRef(new Set<string>());
   const previousFocus = useRef<HTMLElement | null>(null);
   const router = useRouter();
   const noticeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const profile = profileState?.userId === currentUserId ? profileState.profile : null;
+
+  useEffect(() => {
+    const onlineCheck = window.setTimeout(() => setIsOnline(navigator.onLine), 0);
+    const handleOnline = () => setIsOnline(true);
+    const handleOffline = () => setIsOnline(false);
+    window.addEventListener("online", handleOnline);
+    window.addEventListener("offline", handleOffline);
+    return () => {
+      window.clearTimeout(onlineCheck);
+      window.removeEventListener("online", handleOnline);
+      window.removeEventListener("offline", handleOffline);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (process.env.NODE_ENV !== "production" || !("serviceWorker" in navigator)) return;
+    void navigator.serviceWorker.register("/sw.js").catch((error: unknown) => {
+      console.error("Service worker registration failed:", error);
+    });
+  }, []);
+
+  useEffect(() => {
+    function focusSearch(event: globalThis.KeyboardEvent) {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        postSearchRef.current?.focus();
+      }
+    }
+    window.addEventListener("keydown", focusSearch);
+    return () => window.removeEventListener("keydown", focusSearch);
+  }, []);
+
+  useEffect(() => {
+    const log = chatLogRef.current;
+    if (log) log.scrollTop = log.scrollHeight;
+  }, [messages, citySlug, channelId]);
 
   useEffect(() => () => {
     for (const url of imageUrls.current) URL.revokeObjectURL(url);
@@ -396,7 +437,7 @@ export default function Home() {
           throw new Error("The server returned an invalid message response.");
         }
         if (!active) return;
-        const nextMessages = parsed.data.messages.map((message) => ({
+        const nextMessages: Message[] = parsed.data.messages.map((message) => ({
           id: message.id,
           body: message.body,
           time: message.time,
@@ -407,18 +448,23 @@ export default function Home() {
         }));
         setMessages((current) => {
           const previous = current[key] ?? [];
-          const unchanged = previous.length === nextMessages.length
+          const pending = previous.filter((message) =>
+            message.delivery && !nextMessages.some((next) => next.fromYou && next.body === message.body),
+          );
+          const merged = [...nextMessages, ...pending];
+          const unchanged = previous.length === merged.length
             && previous.every((message, index) => {
-              const next = nextMessages[index];
+              const next = merged[index];
               return message.id === next.id
                 && message.body === next.body
                 && message.time === next.time
                 && message.fromYou === next.fromYou
                 && message.author === next.author
                 && message.author_username === next.author_username
-                && message.initials === next.initials;
+                && message.initials === next.initials
+                && message.delivery === next.delivery;
             });
-          return unchanged ? current : { ...current, [key]: nextMessages };
+          return unchanged ? current : { ...current, [key]: merged };
         });
         setChatLoadError(null);
       } catch (error) {
@@ -436,7 +482,7 @@ export default function Home() {
       active = false;
       window.clearInterval(refresh);
     };
-  }, [citySlug, channelId]);
+  }, [citySlug, channelId, chatRefresh]);
 
   const blockedAuthors = useMemo(
     () => blockedState?.userId === currentUserId ? blockedState.accounts : [],
@@ -448,7 +494,6 @@ export default function Home() {
     : postLoadResult?.city === citySlug ? postLoadResult.error : null;
   const city = CITIES.find((item) => item.slug === citySlug) ?? CITIES[0];
   const channels = city.slug === "general" ? GENERAL_CHANNELS : CITY_CHANNELS;
-  const primaryChannel = channels[0];
   const visiblePosts = useMemo(
     () =>
       posts.filter((post) => {
@@ -651,6 +696,7 @@ export default function Home() {
 
   useEffect(() => {
     const anyModalOpen =
+      mobileCitiesOpen ||
       authOpen ||
       reportTarget !== null ||
       safetyCenterOpen ||
@@ -663,7 +709,38 @@ export default function Home() {
       previousFocus.current.focus({ preventScroll: true });
       previousFocus.current = null;
     }
-  }, [authOpen, reportTarget, safetyCenterOpen, pendingShare]);
+  }, [mobileCitiesOpen, authOpen, reportTarget, safetyCenterOpen, pendingShare]);
+
+  useEffect(() => {
+    if (!mobileCitiesOpen) return;
+    const focusTimer = window.setTimeout(() => mobileCitySearchRef.current?.focus(), 0);
+    const handleKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setMobileCitiesOpen(false);
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const dialog = document.querySelector(".mobile-cities-drawer");
+      const focusable = dialog?.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), input:not([disabled]), [href], [tabindex]:not([tabindex="-1"])',
+      );
+      if (!focusable?.length) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.clearTimeout(focusTimer);
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [mobileCitiesOpen]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -717,7 +794,8 @@ export default function Home() {
 
   function selectCity(slug: string) {
     setCitySlug(slug);
-    setMobileView("chat");
+    setMobileView("board");
+    setMobileCitiesOpen(false);
     setPostSearch("");
     setChannelId(slug === "general" ? "chitchat" : "city-chat");
   }
@@ -943,9 +1021,9 @@ export default function Home() {
     setNotice({ kind: "success", text: "You have signed out." });
   }
 
-  async function sendMessage(text: string) {
+  async function sendMessage(text: string, retryId?: string) {
     if (!isSupabaseConfigured()) {
-      setChatError("Configure Supabase before sending shared messages.");
+      setChatError("Messages can’t be sent right now. Please try again later.");
       return;
     }
     if (!currentUser) {
@@ -966,6 +1044,27 @@ export default function Home() {
       return;
     }
 
+    const key = `${citySlug}:${channelId}`;
+    const messageId = retryId ?? `pending-${crypto.randomUUID()}`;
+    const optimisticMessage: Message = {
+      id: messageId,
+      body: parsed.data.body,
+      time: "Sending…",
+      fromYou: true,
+      author: profile?.display_name || profile?.username || "You",
+      author_username: profile?.username ?? null,
+      initials: profile ? initials(profile.display_name || profile.username) : "YO",
+      delivery: "sending",
+    };
+    setMessages((current) => ({
+      ...current,
+      [key]: retryId
+        ? (current[key] ?? []).map((message) => message.id === retryId ? optimisticMessage : message)
+        : [...(current[key] ?? []), optimisticMessage],
+    }));
+    setChatError(null);
+    setChatSending(true);
+
     try {
       const response = await fetch("/api/messages", {
         method: "POST",
@@ -977,10 +1076,9 @@ export default function Home() {
         throw new Error(typeof result.error === "string" ? result.error : "Could not send your message.");
       }
       const result = await response.json();
-      const key = `${citySlug}:${channelId}`;
       setMessages((current) => ({
         ...current,
-        [key]: [...(current[key] ?? []), {
+        [key]: (current[key] ?? []).map((message) => message.id === messageId ? {
           id: result.message.id,
           body: result.message.body,
           time: result.message.time,
@@ -988,14 +1086,23 @@ export default function Home() {
           author: result.message.author,
           author_username: result.message.author_username ?? null,
           initials: result.message.initials,
-        }],
+        } : message),
       }));
       setChatDraft("");
       setChatError(null);
       setChatCooldown(true);
       window.setTimeout(() => setChatCooldown(false), 3000);
     } catch (error) {
-      setChatError(error instanceof Error ? error.message : "Your message could not be sent. Please try again.");
+      console.error("Message send failed:", error);
+      setMessages((current) => ({
+        ...current,
+        [key]: (current[key] ?? []).map((message) => message.id === messageId
+          ? { ...message, time: "Not sent", delivery: "failed" }
+          : message),
+      }));
+      setChatError("Message wasn’t sent. Check your connection and retry.");
+    } finally {
+      setChatSending(false);
     }
   }
 
@@ -1213,7 +1320,7 @@ export default function Home() {
 
   return (
     <>
-    <div className={`app-shell ${mobileView === "chat" ? "mobile-chat-mode" : ""}`}>
+    <div className={`app-shell ${mobileView === "chat" ? "mobile-chat-shell" : ""}`}>
       <aside className="sidebar" aria-label="VibeChat navigation">
         <SiteBrand />
         <div className="sidebar-label-row">
@@ -1290,17 +1397,13 @@ export default function Home() {
             <>
               <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
                 {profile.avatar_url ? (
-                  <Image src={profile.avatar_url} alt="Avatar" width={28} height={28} unoptimized style={{ width: 28, height: 28, borderRadius: 50, objectFit: "cover", border: "1px solid #4b4c3f" }} />
+                  <Image className="sidebar-profile-avatar" src={profile.avatar_url} alt={`${profile.display_name || profile.username} avatar`} width={28} height={28} unoptimized />
                 ) : (
-                  <span style={{
-                    width: 28, height: 28, borderRadius: 50, background: "#303126", color: "#e1c37f",
-                    fontSize: 10, fontWeight: 700, display: "grid", placeItems: "center", flex: "none",
-                    border: "1px solid #4b4c3f",
-                  }}>{(profile.display_name || profile.username).split(/[_\s]+/).map((p: string) => p[0]).filter(Boolean).slice(0, 2).join("").toUpperCase() || "?"}</span>
+                  <span className="sidebar-profile-placeholder" aria-hidden="true">{(profile.display_name || profile.username).split(/[_\s]+/).map((p: string) => p[0]).filter(Boolean).slice(0, 2).join("").toUpperCase() || "?"}</span>
                 )}
                 <div style={{ minWidth: 0 }}>
-                  <strong style={{ display: "block", fontSize: 13, color: "#e7e5de" }}>{profile.display_name || profile.username}</strong>
-                  {profile.tag && <span style={{ fontSize: 11, color: "#a0a699", background: "#22251f", border: "1px solid #343830", borderRadius: 4, padding: "0 6px" }}>{profile.tag}</span>}
+                  <strong className="sidebar-profile-name">{profile.display_name || profile.username}</strong>
+                  {profile.tag && <span className="sidebar-profile-tag">{profile.tag}</span>}
                 </div>
               </div>
             </>
@@ -1320,9 +1423,10 @@ export default function Home() {
         <header className="topbar">
           <div className="breadcrumbs"><span>Community</span><span aria-hidden="true">/</span><strong>{city.name}</strong></div>
           <div className="topbar-actions">
-            <div className="search-wrap">
+            <div className="search-wrap post-search-wrap">
               <label className="sr-only" htmlFor="post-search">Search posts in {city.name}</label>
               <input
+                ref={postSearchRef}
                 id="post-search"
                 className="search-input post-search"
                 value={postSearch}
@@ -1330,6 +1434,8 @@ export default function Home() {
                 placeholder="Search this board"
                 type="search"
               />
+              <span className="search-icon" aria-hidden="true">⌕</span>
+              <kbd className="search-shortcut" aria-hidden="true">⌘K</kbd>
               {postSearch.trim() && (
                 <button
                   className="button button-small search-clear"
@@ -1446,9 +1552,10 @@ export default function Home() {
             </div>
 
             {postsError ? (
-              <div className="empty-state card" role="alert">
-                <h2>Posts could not be loaded</h2>
-                <p>{postsError}</p>
+              <div className="empty-state card compact-error-state" role="alert">
+                <span className="empty-mark" aria-hidden="true">!</span>
+                <h2>Something went wrong</h2>
+                <p>We couldn’t load posts. Please try again.</p>
                 <button className="button" type="button" onClick={() => setPostsRefresh((value) => value + 1)}>Try again</button>
               </div>
             ) : loading ? (
@@ -1476,7 +1583,10 @@ export default function Home() {
                         ) : (
                           <span className="avatar">{post.initials}</span>
                         )}
-                        <div className="author-line"><strong>{post.author}</strong><span>{post.time}</span></div>
+                        <div className="author-line">
+                          <strong>{post.author}</strong>
+                          <span>{CITIES.find((item) => item.slug === post.city)?.name ?? post.city} · {post.time}</span>
+                        </div>
                         <span className="tag">{post.tag}</span>
                         <details className="post-menu">
                           <summary aria-label={`More actions for ${post.title}`}>•••</summary>
@@ -1510,7 +1620,7 @@ export default function Home() {
                       ) : (
                         <div className="post-content">
                           <h3>{post.title}</h3>
-                          <p>{post.body}</p>
+                          <p className="post-preview">{post.body}</p>
                           {post.images && post.images.length > 0 && (
                             <div className="image-gallery">
                               {post.images.map((image) => (
@@ -1551,20 +1661,16 @@ export default function Home() {
 
           <section className="chat-panel" aria-label={`${city.name} chat`}>
             <header className="mobile-chat-heading">
-              <h1>{city.slug === "general" ? "General Chat" : `${city.name} Chat`}</h1>
-              <button
-                className="chat-chaat-button"
-                type="button"
-                aria-pressed={channelId === primaryChannel.id}
-                onClick={() => setChannelId(primaryChannel.id)}
-              >
-                Chat-Chaat
-              </button>
+              <button className="chat-back-button" type="button" onClick={() => setMobileView("board")} aria-label="Back to posts">‹</button>
+              <div>
+                <h1>{city.slug === "general" ? "General Chat" : `${city.name} Chat`}</h1>
+                <span>{channels.find((channel) => channel.id === channelId)?.label}</span>
+              </div>
             </header>
 
             <div className="chat-heading desktop-chat-heading">
               <div><p className="eyebrow">Community chat</p><h2>{city.name}</h2></div>
-              <span className="demo-status"><span />{isSupabaseConfigured() ? "Shared messages" : "Supabase setup required"}</span>
+              <span className="demo-status"><span />Shared chat</span>
             </div>
             <div className="channel-list" role="tablist" aria-label="Chat channels">
               {channels.map((channel) => (
@@ -1580,93 +1686,107 @@ export default function Home() {
                 </button>
               ))}
             </div>
-            <nav className={`mobile-chat-rail mobile-chat-rail-left ${leftRailOpen ? "rail-expanded" : ""}`} aria-label="City navigation">
-              <button
-                className="rail-toggle"
-                type="button"
-                aria-label={`${leftRailOpen ? "Collapse" : "Expand"} city sidebar`}
-                aria-expanded={leftRailOpen}
-                onClick={() => setLeftRailOpen((open) => !open)}
-              >{leftRailOpen ? "‹" : "›"}</button>
-              {leftRailOpen && (
-                <div className="rail-items">
-                  {joined.map((slug) => {
-                    const item = CITIES.find((candidate) => candidate.slug === slug);
-                    if (!item) return null;
-                    return (
-                      <button
-                        className={`rail-item ${citySlug === slug ? "rail-item-active" : ""}`}
-                        key={slug}
-                        type="button"
-                        aria-label={`Open ${item.name} chat`}
-                        onClick={() => { selectCity(slug); setLeftRailOpen(false); }}
-                      >{initials(item.name)}</button>
-                    );
-                  })}
-                </div>
-              )}
-            </nav>
-
-            <nav className={`mobile-chat-rail mobile-chat-rail-right ${rightRailOpen ? "rail-expanded" : ""}`} aria-label="Chat channels">
-              <button
-                className="rail-toggle"
-                type="button"
-                aria-label={`${rightRailOpen ? "Collapse" : "Expand"} channel sidebar`}
-                aria-expanded={rightRailOpen}
-                onClick={() => setRightRailOpen((open) => !open)}
-              >{rightRailOpen ? "›" : "‹"}</button>
-              {rightRailOpen && (
-                <div className="rail-items">
-                  {channels.map((channel) => (
-                    <button
-                      className={`rail-item ${channelId === channel.id ? "rail-item-active" : ""}`}
-                      key={channel.id}
-                      type="button"
-                      aria-label={`Open ${channel.label} channel`}
-                      aria-pressed={channelId === channel.id}
-                      onClick={() => { setChannelId(channel.id); setRightRailOpen(false); }}
-                    >#</button>
-                  ))}
-                </div>
-              )}
-            </nav>
-
+            {!isOnline && <div className="offline-banner" role="status">You’re offline. Messages may not send yet.</div>}
             <div className="chat-log" ref={chatLogRef} role="log" aria-live="polite" aria-relevant="additions text" aria-label="Conversation">
               {chatLoading && currentMessages.length === 0 ? (
-                <div className="chat-loading" role="status">Loading conversation…</div>
+                <div className="chat-loading" role="status" aria-label="Loading conversation">
+                  {[1, 2, 3].map((item) => <div className="message-skeleton" key={item}><span className="skeleton skeleton-avatar" /><span className="skeleton skeleton-message" /></div>)}
+                </div>
               ) : chatLoadError && currentMessages.length === 0 ? (
-                <div className="chat-empty" role="alert">
-                  <h3>Chat is unavailable</h3>
-                  <p>{chatLoadError}</p>
+                <div className="chat-empty chat-error-state" role="alert">
+                  <span className="empty-mark" aria-hidden="true">!</span>
+                  <h3>Something went wrong</h3>
+                  <p>We couldn’t load the conversation. Try again in a moment.</p>
+                  <button className="button button-small" type="button" onClick={() => setChatRefresh((value) => value + 1)}>Try again</button>
                 </div>
               ) : currentMessages.length === 0 ? (
                 <div className="chat-empty">
                   <h3>No messages yet</h3>
-                  <p>Start a conversation in {channels.find((channel) => channel.id === channelId)?.label}.</p>
+                  <p>No one’s said anything here yet. Be the first to send a message.</p>
                 </div>
-              ) : currentMessages.map((message) => (
-                <article className={`chat-message ${message.fromYou ? "chat-message-own" : ""}`} key={message.id}>
-                  {!message.fromYou && <span className="avatar avatar-small">{message.initials}</span>}
+              ) : currentMessages.map((message, index) => {
+                const previous = currentMessages[index - 1];
+                const grouped = previous?.author === message.author && previous?.fromYou === message.fromYou;
+                return (
+                <article className={`chat-message ${message.fromYou ? "chat-message-own" : ""} ${grouped ? "chat-message-grouped" : ""}`} key={message.id}>
+                  {!grouped && <span className="avatar avatar-small">{message.initials}</span>}
                   <div className="message-content">
-                    <div className="message-meta"><strong>{message.fromYou ? "You" : message.author}</strong><time>{message.time}</time></div>
+                    {!grouped && <div className="message-meta"><strong>{message.fromYou ? "You" : message.author}</strong><time>{message.time}</time></div>}
                     {message.body && <p>{message.body}</p>}
+                    {message.delivery === "sending" && <span className="message-delivery">Sending…</span>}
+                    {message.delivery === "failed" && (
+                      <button className="message-retry" type="button" disabled={chatSending} onClick={() => void sendMessage(message.body, message.id)}>Not sent · Retry</button>
+                    )}
                   </div>
-                  {message.fromYou && <span className="avatar avatar-small">{message.initials}</span>}
                 </article>
-              ))}
+              );})}
             </div>
             <form className="chat-form" onSubmit={submitMessage}>
               <label className="sr-only" htmlFor="chat-message">Message Chat-Chaat</label>
-              <textarea id="chat-message" value={chatDraft} onKeyDown={handleComposerKeyDown} onChange={(event) => setChatDraft(event.target.value)} placeholder="Message Chat-Chaat…" maxLength={2000} rows={2} enterKeyHint="send" />
+              <textarea
+                id="chat-message"
+                ref={chatInputRef}
+                value={chatDraft}
+                onKeyDown={handleComposerKeyDown}
+                onChange={(event) => {
+                  setChatDraft(event.target.value);
+                  event.currentTarget.style.height = "auto";
+                  event.currentTarget.style.height = `${Math.min(event.currentTarget.scrollHeight, 120)}px`;
+                }}
+                placeholder="Message Chat-Chaat…"
+                maxLength={2000}
+                rows={1}
+                enterKeyHint="send"
+              />
               {chatError && <p className="chat-error" role="alert">{chatError}</p>}
               <div className="chat-form-footer">
-                <span className="subtle">Shared with this channel · Enter to send · Shift+Enter for a new line</span>
-                <button className="button button-primary button-small" type="submit" disabled={chatCooldown || !chatDraft.trim()}>{chatCooldown ? "Wait 3s…" : "Send"}</button>
+                <span className="subtle">Enter to send · Shift+Enter for a new line</span>
+                <button className="button button-primary button-small" type="submit" disabled={chatCooldown || chatSending || !chatDraft.trim()}>{chatCooldown ? "Wait 3s…" : chatSending ? "Sending…" : "Send"}</button>
               </div>
             </form>
           </section>
         </div>
       </main>
+
+      <nav className="mobile-tab-bar" aria-label="Main navigation">
+        <button type="button" onClick={() => { setMobileCitiesOpen(true); setMobileView("board"); }} aria-expanded={mobileCitiesOpen} aria-label="Cities">
+          <span aria-hidden="true">⌖</span><span>Cities</span>
+        </button>
+        <button type="button" className={mobileView === "board" && !mobileCitiesOpen ? "mobile-tab-active" : ""} onClick={() => { setMobileView("board"); setMobileCitiesOpen(false); }} aria-current={mobileView === "board" && !mobileCitiesOpen ? "page" : undefined}>
+          <span aria-hidden="true">▤</span><span>Posts</span>
+        </button>
+        <button type="button" className={mobileView === "chat" ? "mobile-tab-active" : ""} onClick={() => { setMobileView("chat"); setMobileCitiesOpen(false); }} aria-current={mobileView === "chat" ? "page" : undefined}>
+          <span aria-hidden="true">▢</span><span>Chat</span>
+        </button>
+        <Link href="/profile" className="mobile-profile-tab"><span aria-hidden="true">◉</span><span>Profile</span></Link>
+      </nav>
+
+      {mobileCitiesOpen && (
+        <div className="mobile-cities-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setMobileCitiesOpen(false); }}>
+          <section className="mobile-cities-drawer" role="dialog" aria-modal="true" aria-labelledby="mobile-cities-title">
+            <span className="sheet-handle" aria-hidden="true" />
+            <div className="mobile-drawer-heading">
+              <h2 id="mobile-cities-title">Your cities</h2>
+              <button className="icon-button" type="button" onClick={() => setMobileCitiesOpen(false)} aria-label="Close city list">×</button>
+            </div>
+            <div className="search-wrap">
+              <label className="sr-only" htmlFor="mobile-city-search">Find a city</label>
+              <input id="mobile-city-search" ref={mobileCitySearchRef} className="search-input" value={citySearch} onChange={(event) => setCitySearch(event.target.value)} placeholder="Find a city" type="search" />
+            </div>
+            <nav className="mobile-cities-list" aria-label="Cities">
+              {(citySearch.trim() ? cityMatches : joined.map((slug) => CITIES.find((item) => item.slug === slug)).filter((item): item is (typeof CITIES)[number] => Boolean(item))).map((item) => (
+                <button className={`mobile-city-row ${citySlug === item.slug ? "mobile-city-active" : ""}`} type="button" key={item.slug} aria-current={citySlug === item.slug ? "page" : undefined} onClick={() => { selectCity(item.slug); setMobileCitiesOpen(false); }}>
+                  <span>{item.name}</span>{item.slug === "general" && <span className="always-joined">Default</span>}
+                </button>
+              ))}
+              {citySearch.trim() && cityMatches.length === 0 && <p className="subtle empty-search">No cities match that search.</p>}
+            </nav>
+            {citySearch.trim() && cityMatches.filter((item) => !joined.includes(item.slug)).map((item) => (
+              <button className="button button-primary mobile-join-city" type="button" key={`join-${item.slug}`} onClick={() => { joinCity(item.slug); setMobileCitiesOpen(false); }}>Join {item.name}</button>
+            ))}
+          </section>
+        </div>
+      )}
 
       {authOpen && (
         <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setAuthOpen(false); }}>
